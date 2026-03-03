@@ -19,10 +19,13 @@ It is built for daily research + social publishing workflows: run experiments, m
   - memory usage
   - ANE utilization and TFLOPS (when emitted by the pipeline)
   - fallback extraction from research result files when stdout metrics are absent
+- Queue + scheduler controls for fast/full/benchmark run presets
+- Guardrails for heavier runs (battery + thermal checks)
 - Local chat panel:
   - model selector
   - streaming responses
   - built around local `ollama` runtime
+- Repro bundle export + benchmark summary markdown for repeatable reporting
 - Model tracker:
   - continuously scans the selected ANE repo
   - tracks common model artifact types (`.safetensors`, `.gguf`, `.onnx`, `.mlmodel`, `.mlpackage`, `.pt`, `.pth`, `.bin`)

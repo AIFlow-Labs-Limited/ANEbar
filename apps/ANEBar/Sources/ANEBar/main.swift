@@ -82,20 +82,134 @@ private struct RunRecord: Codable {
     var avgTrainMS: Double?
 }
 
+private func anebarDataDirectory() -> URL {
+    let fileManager = FileManager.default
+    let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+    return appSupport.appendingPathComponent("ANEBar", isDirectory: true)
+}
+
+private struct QueueItem: Codable {
+    var id: String
+    var preset: String
+    var createdAt: Date
+    var scheduledAt: Date
+    var startedAt: Date?
+    var finishedAt: Date?
+    var state: String
+    var exitCode: Int32?
+}
+
+private final class RunQueueStore {
+    let fileURL: URL
+    private(set) var items: [QueueItem] = []
+    private let maxItems = 200
+
+    init(baseDirectory: URL) {
+        fileURL = baseDirectory.appendingPathComponent("run_queue.json")
+        load()
+    }
+
+    func enqueue(preset: RunPreset, delaySeconds: TimeInterval = 0) -> QueueItem {
+        let now = Date()
+        let item = QueueItem(
+            id: UUID().uuidString,
+            preset: preset.rawValue,
+            createdAt: now,
+            scheduledAt: now.addingTimeInterval(max(0, delaySeconds)),
+            startedAt: nil,
+            finishedAt: nil,
+            state: "pending",
+            exitCode: nil
+        )
+        items.append(item)
+        trimAndSave()
+        return item
+    }
+
+    func duePending(at now: Date = Date()) -> QueueItem? {
+        items.first { $0.state == "pending" && $0.scheduledAt <= now }
+    }
+
+    func pendingCount() -> Int {
+        items.filter { $0.state == "pending" }.count
+    }
+
+    func markRunning(id: String, at date: Date = Date()) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].state = "running"
+        items[index].startedAt = date
+        save()
+    }
+
+    func markFinished(id: String, exitCode: Int32, at date: Date = Date()) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].state = exitCode == 0 ? "done" : "failed"
+        items[index].finishedAt = date
+        items[index].exitCode = exitCode
+        trimAndSave()
+    }
+
+    func cancelAllPending() {
+        for index in items.indices where items[index].state == "pending" {
+            items[index].state = "canceled"
+            items[index].finishedAt = Date()
+        }
+        trimAndSave()
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            items = []
+            return
+        }
+        do {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            items = try decoder.decode([QueueItem].self, from: data)
+        } catch {
+            items = []
+        }
+    }
+
+    private func trimAndSave() {
+        if items.count > maxItems {
+            items.removeFirst(items.count - maxItems)
+        }
+        save()
+    }
+
+    private func save() {
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(items)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            // Ignore save failures.
+        }
+    }
+}
+
+private struct BatteryStatus {
+    var percent: Int?
+    var isCharging: Bool
+    var raw: String
+}
+
 private final class RunHistoryStore {
+    let baseDirectory: URL
     let fileURL: URL
     private(set) var records: [RunRecord] = []
     private let maxRecords = 500
 
-    init() {
-        let fileManager = FileManager.default
-        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        let directory = appSupport.appendingPathComponent("ANEBar", isDirectory: true)
-        fileURL = directory.appendingPathComponent("run_history.json")
+    init(baseDirectory: URL = anebarDataDirectory()) {
+        self.baseDirectory = baseDirectory
+        fileURL = baseDirectory.appendingPathComponent("run_history.json")
 
         do {
-            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
         } catch {
             // Ignore and continue with best-effort persistence.
         }
@@ -226,6 +340,40 @@ private func readGitDirty(in repoRoot: String) -> Bool {
     return !result.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 }
 
+private func readGitAheadBehind(in repoRoot: String) -> (ahead: Int, behind: Int)? {
+    let quoted = shellQuote(repoRoot)
+    let command = "git -C \(quoted) rev-list --left-right --count HEAD...origin/main"
+    let result = runShellCommand(command)
+    guard result.status == 0 else {
+        return nil
+    }
+    let tokens = result.output
+        .split(whereSeparator: \.isWhitespace)
+        .map(String.init)
+    guard tokens.count >= 2,
+          let ahead = Int(tokens[0]),
+          let behind = Int(tokens[1])
+    else {
+        return nil
+    }
+    return (ahead: ahead, behind: behind)
+}
+
+private func readBatteryStatus() -> BatteryStatus {
+    let result = runShellCommand("pmset -g batt")
+    let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard result.status == 0 else {
+        return BatteryStatus(percent: nil, isCharging: false, raw: output)
+    }
+
+    let percentMatch = output.range(of: #"(\d+)%"#, options: .regularExpression)
+    let percent = percentMatch.flatMap { Int(output[$0].dropLast()) }
+    let isCharging = output.localizedCaseInsensitiveContains("AC Power")
+        || output.localizedCaseInsensitiveContains("charging")
+        || output.localizedCaseInsensitiveContains("charged")
+    return BatteryStatus(percent: percent, isCharging: isCharging, raw: output)
+}
+
 private func discoverModelCatalog(in repoRoot: String) -> ModelCatalog {
     let fileManager = FileManager.default
     let rootURL = URL(fileURLWithPath: repoRoot, isDirectory: true)
@@ -317,6 +465,86 @@ private func discoverModelCatalog(in repoRoot: String) -> ModelCatalog {
     return ModelCatalog(artifacts: artifacts)
 }
 
+private struct ModelHealthSummary {
+    var new24h: Int
+    var new7d: Int
+    var missingTokenizer: Int
+    var missingConfig: Int
+    var sizeBucketCounts: [String: Int]
+}
+
+private func modelHealthSummary(catalog: ModelCatalog, repoRoot: String) -> ModelHealthSummary {
+    let fileManager = FileManager.default
+    let now = Date()
+    let oneDayAgo = now.addingTimeInterval(-24 * 3600)
+    let oneWeekAgo = now.addingTimeInterval(-7 * 24 * 3600)
+
+    var new24h = 0
+    var new7d = 0
+    var missingTokenizer = 0
+    var missingConfig = 0
+    var buckets: [String: Int] = [:]
+
+    func sizeBucket(for size: UInt64) -> String {
+        switch size {
+        case 0..<10_000_000:
+            return "<10MB"
+        case 10_000_000..<100_000_000:
+            return "10-100MB"
+        case 100_000_000..<1_000_000_000:
+            return "100MB-1GB"
+        default:
+            return ">=1GB"
+        }
+    }
+
+    for artifact in catalog.artifacts {
+        if let modifiedAt = artifact.modifiedAt {
+            if modifiedAt >= oneDayAgo {
+                new24h += 1
+            }
+            if modifiedAt >= oneWeekAgo {
+                new7d += 1
+            }
+        }
+
+        buckets[sizeBucket(for: artifact.sizeBytes), default: 0] += 1
+
+        let needsTokenizer = ["gguf", "safetensors", "pt", "pth", "bin", "onnx"].contains(artifact.fileExtension)
+        let needsConfig = ["safetensors", "pt", "pth", "onnx"].contains(artifact.fileExtension)
+        if !(needsTokenizer || needsConfig) {
+            continue
+        }
+
+        let parent = URL(fileURLWithPath: repoRoot).appendingPathComponent(artifact.relativePath).deletingLastPathComponent().path
+        let tokenizerCandidates = [
+            "\(parent)/tokenizer.json",
+            "\(parent)/tokenizer.model",
+            "\(parent)/tokenizer.bin",
+            "\(parent)/vocab.json",
+        ]
+        let configCandidates = [
+            "\(parent)/config.json",
+            "\(parent)/generation_config.json",
+        ]
+
+        if needsTokenizer && !tokenizerCandidates.contains(where: { fileManager.fileExists(atPath: $0) }) {
+            missingTokenizer += 1
+        }
+        if needsConfig && !configCandidates.contains(where: { fileManager.fileExists(atPath: $0) }) {
+            missingConfig += 1
+        }
+    }
+
+    return ModelHealthSummary(
+        new24h: new24h,
+        new7d: new7d,
+        missingTokenizer: missingTokenizer,
+        missingConfig: missingConfig,
+        sizeBucketCounts: buckets
+    )
+}
+
 private func formatBytes(_ bytes: UInt64) -> String {
     let formatter = ByteCountFormatter()
     formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
@@ -344,6 +572,21 @@ private func formatDuration(_ seconds: Double) -> String {
 private func formatSigned(_ value: Double, suffix: String = "") -> String {
     let sign = value >= 0 ? "+" : ""
     return String(format: "%@%.2f%@", sign, value, suffix)
+}
+
+private func thermalLabel(_ state: ProcessInfo.ThermalState) -> String {
+    switch state {
+    case .nominal:
+        return "nominal"
+    case .fair:
+        return "fair"
+    case .serious:
+        return "serious"
+    case .critical:
+        return "critical"
+    @unknown default:
+        return "unknown"
+    }
 }
 
 private struct ResearchSummarySnapshot {
@@ -426,12 +669,15 @@ private final class ChatWindowController: NSWindowController {
     private let sendButton = NSButton(title: "Send", target: nil, action: nil)
     private let stopButton = NSButton(title: "Stop", target: nil, action: nil)
     private let refreshButton = NSButton(title: "Refresh Models", target: nil, action: nil)
+    private let pullSmallModelButton = NSButton(title: "Pull qwen2.5:0.5b", target: nil, action: nil)
     private let clearButton = NSButton(title: "Clear", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "Local chat ready")
     private let outputTextView = NSTextView(frame: .zero)
 
     private var chatProcess: Process?
     private var fallbackModels: [String] = []
+    private var streamStartedAt: Date?
+    private var streamTokenApproxCount: Int = 0
 
     override init(window: NSWindow?) {
         let initialRect = NSRect(x: 0, y: 0, width: 680, height: 520)
@@ -484,6 +730,9 @@ private final class ChatWindowController: NSWindowController {
         refreshButton.target = self
         refreshButton.action = #selector(refreshModels)
 
+        pullSmallModelButton.target = self
+        pullSmallModelButton.action = #selector(pullSmallModel)
+
         clearButton.target = self
         clearButton.action = #selector(clearOutput)
 
@@ -504,7 +753,7 @@ private final class ChatWindowController: NSWindowController {
         scrollView.documentView = outputTextView
 
         let controlsStack = NSStackView(views: [
-            titleLabel, modelPopup, refreshButton, stopButton, clearButton,
+            titleLabel, modelPopup, refreshButton, pullSmallModelButton, stopButton, clearButton,
         ])
         controlsStack.orientation = .horizontal
         controlsStack.spacing = 10
@@ -593,6 +842,25 @@ private final class ChatWindowController: NSWindowController {
         outputTextView.string = ""
     }
 
+    @objc private func pullSmallModel() {
+        guard chatProcess == nil else {
+            statusLabel.stringValue = "Stop current chat before pulling."
+            return
+        }
+        statusLabel.stringValue = "Pulling qwen2.5:0.5b..."
+        appendOutput("\n[pull] ollama pull qwen2.5:0.5b\n")
+        let result = runShellCommand("ollama pull qwen2.5:0.5b")
+        if !result.output.isEmpty {
+            appendOutput(result.output + "\n")
+        }
+        if result.status == 0 {
+            statusLabel.stringValue = "Model pulled. Refreshing list..."
+            reloadModels(preserveSelection: true)
+        } else {
+            statusLabel.stringValue = "Pull failed. Check Ollama service."
+        }
+    }
+
     @objc private func sendPrompt() {
         guard chatProcess == nil else {
             return
@@ -612,6 +880,8 @@ private final class ChatWindowController: NSWindowController {
         promptField.stringValue = ""
 
         appendOutput("\nYou: \(prompt)\nAssistant: ")
+        streamStartedAt = Date()
+        streamTokenApproxCount = 0
 
         let command = "ollama run \(shellQuote(model)) \(shellQuote(prompt))"
         let process = Process()
@@ -628,6 +898,7 @@ private final class ChatWindowController: NSWindowController {
             }
             Task { @MainActor in
                 self?.appendOutput(text)
+                self?.updateStreamingStatus(with: text)
             }
         }
 
@@ -637,6 +908,8 @@ private final class ChatWindowController: NSWindowController {
                 self?.chatProcess = nil
                 self?.sendButton.isEnabled = true
                 self?.stopButton.isEnabled = false
+                self?.streamStartedAt = nil
+                self?.streamTokenApproxCount = 0
                 if proc.terminationStatus == 0 {
                     self?.statusLabel.stringValue = "Completed."
                     self?.appendOutput("\n")
@@ -667,6 +940,16 @@ private final class ChatWindowController: NSWindowController {
     private func appendOutput(_ text: String) {
         outputTextView.textStorage?.append(NSAttributedString(string: text))
         outputTextView.scrollToEndOfDocument(nil)
+    }
+
+    private func updateStreamingStatus(with chunk: String) {
+        streamTokenApproxCount += chunk.split(whereSeparator: \.isWhitespace).count
+        guard let started = streamStartedAt else {
+            return
+        }
+        let elapsed = max(0.001, Date().timeIntervalSince(started))
+        let tokPerSec = Double(streamTokenApproxCount) / elapsed
+        statusLabel.stringValue = String(format: "Streaming... %.1f tok/s (approx)", tokPerSec)
     }
 }
 
@@ -1007,12 +1290,18 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private var runFastItem = NSMenuItem()
     private var runFullItem = NSMenuItem()
     private var runBenchmarkItem = NSMenuItem()
+    private var queueFastItem = NSMenuItem()
+    private var queueFullItem = NSMenuItem()
+    private var queueBenchmarkItem = NSMenuItem()
+    private var queueSummaryItem = NSMenuItem()
 
     private var statusLineItem = NSMenuItem()
     private var repoLineItem = NSMenuItem()
+    private var guardrailItem = NSMenuItem()
 
     private var upstreamHeadItem = NSMenuItem()
     private var upstreamMetaItem = NSMenuItem()
+    private var upstreamSyncItem = NSMenuItem()
 
     private var modelSummaryItem = NSMenuItem()
     private var modelDeltaItem = NSMenuItem()
@@ -1026,8 +1315,10 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private var chatWindowController: ChatWindowController?
 
     private let historyStore = RunHistoryStore()
+    private let queueStore = RunQueueStore(baseDirectory: anebarDataDirectory())
 
     private var process: Process?
+    private var activeQueueItemID: String?
     private var runStartedAt: Date?
     private var currentRunPreset: RunPreset?
     private var currentRunCommand: String?
@@ -1114,6 +1405,10 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         repoLineItem.isEnabled = false
         menu.addItem(repoLineItem)
 
+        guardrailItem = NSMenuItem(title: "Guardrails: checking…", action: nil, keyEquivalent: "")
+        guardrailItem.isEnabled = false
+        menu.addItem(guardrailItem)
+
         upstreamHeadItem = NSMenuItem(title: "HEAD: scanning…", action: nil, keyEquivalent: "")
         upstreamHeadItem.isEnabled = false
         menu.addItem(upstreamHeadItem)
@@ -1121,6 +1416,10 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         upstreamMetaItem = NSMenuItem(title: "Repo status: unknown", action: nil, keyEquivalent: "")
         upstreamMetaItem.isEnabled = false
         menu.addItem(upstreamMetaItem)
+
+        upstreamSyncItem = NSMenuItem(title: "Sync: unknown", action: nil, keyEquivalent: "")
+        upstreamSyncItem.isEnabled = false
+        menu.addItem(upstreamSyncItem)
 
         let refreshUpstreamItem = NSMenuItem(title: "Refresh Repo Head", action: #selector(refreshUpstreamManual), keyEquivalent: "u")
         refreshUpstreamItem.target = self
@@ -1162,6 +1461,26 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         runBenchmarkItem.target = self
         menu.addItem(runBenchmarkItem)
 
+        queueFastItem = NSMenuItem(title: "Queue Fast", action: #selector(queueFastRun), keyEquivalent: "")
+        queueFastItem.target = self
+        menu.addItem(queueFastItem)
+
+        queueFullItem = NSMenuItem(title: "Queue Full", action: #selector(queueFullRun), keyEquivalent: "")
+        queueFullItem.target = self
+        menu.addItem(queueFullItem)
+
+        queueBenchmarkItem = NSMenuItem(title: "Queue Benchmark (+10m)", action: #selector(queueBenchmarkRunDelayed), keyEquivalent: "")
+        queueBenchmarkItem.target = self
+        menu.addItem(queueBenchmarkItem)
+
+        queueSummaryItem = NSMenuItem(title: "Queue: 0 pending", action: nil, keyEquivalent: "")
+        queueSummaryItem.isEnabled = false
+        menu.addItem(queueSummaryItem)
+
+        let clearQueueItem = NSMenuItem(title: "Clear Pending Queue", action: #selector(clearPendingQueue), keyEquivalent: "")
+        clearQueueItem.target = self
+        menu.addItem(clearQueueItem)
+
         let openChatItem = NSMenuItem(title: "Open Local Chat", action: #selector(openLocalChat), keyEquivalent: "l")
         openChatItem.target = self
         menu.addItem(openChatItem)
@@ -1187,6 +1506,14 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         let openHistoryItem = NSMenuItem(title: "Open Run History JSON", action: #selector(openRunHistoryFile), keyEquivalent: "j")
         openHistoryItem.target = self
         menu.addItem(openHistoryItem)
+
+        let exportBundleItem = NSMenuItem(title: "Export Repro Bundle", action: #selector(exportReproBundle), keyEquivalent: "e")
+        exportBundleItem.target = self
+        menu.addItem(exportBundleItem)
+
+        let openBenchmarkSummaryItem = NSMenuItem(title: "Open Benchmark Summary", action: #selector(openBenchmarkSummary), keyEquivalent: "k")
+        openBenchmarkSummaryItem.target = self
+        menu.addItem(openBenchmarkSummaryItem)
 
         menu.addItem(.separator())
 
@@ -1222,8 +1549,10 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         if let code = lastExitCode {
             statusLineItem.title = code == 0 ? "Status: last run succeeded" : "Status: last run failed (\(code))"
         }
+        refreshGuardrailLine()
         refreshModelIndex(force: true)
         refreshUpstreamInfo(force: true)
+        refreshQueueSummary()
         refreshRunHistoryLines()
     }
 
@@ -1231,6 +1560,9 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         runFastItem.isEnabled = !running
         runFullItem.isEnabled = !running
         runBenchmarkItem.isEnabled = !running
+        queueFastItem.isEnabled = !running
+        queueFullItem.isEnabled = !running
+        queueBenchmarkItem.isEnabled = !running
         statusLineItem.title = "Status: \(message)"
         updateStatusButton()
     }
@@ -1279,13 +1611,19 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    private func runPreset(_ preset: RunPreset) {
+    private func runPreset(_ preset: RunPreset, queueItemID: String? = nil) {
         guard process == nil else {
             return
         }
 
         guard let command = command(for: preset) else {
             statusLineItem.title = "Status: no matching run command for repo"
+            return
+        }
+
+        if let guardrailMessage = guardrailBlockReason(for: preset) {
+            statusLineItem.title = "Status: blocked by guardrail (\(guardrailMessage))"
+            refreshGuardrailLine()
             return
         }
 
@@ -1296,6 +1634,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         currentRunTotalTFLOPS = nil
         currentRunAvgTrainMS = nil
         runStartedAt = Date()
+        activeQueueItemID = queueItemID
 
         let proc = Process()
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
@@ -1376,11 +1715,17 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         )
 
         historyStore.append(record)
+        if let activeQueueItemID {
+            queueStore.markFinished(id: activeQueueItemID, exitCode: exitCode)
+        }
+        _ = writeBenchmarkSummaryFile()
         refreshRunHistoryLines()
+        refreshQueueSummary()
 
         currentRunPreset = nil
         currentRunCommand = nil
         runStartedAt = nil
+        activeQueueItemID = nil
     }
 
     @objc private func runFastPipeline() {
@@ -1393,6 +1738,30 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
 
     @objc private func runBenchmarkPipeline() {
         runPreset(.benchmark)
+    }
+
+    @objc private func queueFastRun() {
+        _ = queueStore.enqueue(preset: .fast)
+        refreshQueueSummary()
+        statusLineItem.title = "Status: queued fast preset"
+    }
+
+    @objc private func queueFullRun() {
+        _ = queueStore.enqueue(preset: .full)
+        refreshQueueSummary()
+        statusLineItem.title = "Status: queued full preset"
+    }
+
+    @objc private func queueBenchmarkRunDelayed() {
+        _ = queueStore.enqueue(preset: .benchmark, delaySeconds: 10 * 60)
+        refreshQueueSummary()
+        statusLineItem.title = "Status: queued benchmark (+10m)"
+    }
+
+    @objc private func clearPendingQueue() {
+        queueStore.cancelAllPending()
+        refreshQueueSummary()
+        statusLineItem.title = "Status: cleared pending queue"
     }
 
     @objc private func openLocalChat() {
@@ -1524,6 +1893,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         if metricsTick % 5 == 0, let command = currentRunCommand {
             hydrateMetricsFromResearchArtifactsIfNeeded(command: command)
         }
+        runDueQueueIfNeeded()
 
         guard let cpu = metricsSampler.sampleCPU() else {
             return
@@ -1543,6 +1913,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
 
         latestMetrics = sample
         metricsView.push(sample)
+        refreshGuardrailLine()
         updateStatusButton()
     }
 
@@ -1654,6 +2025,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         let currentPaths = Set(catalog.artifacts.map(\.relativePath))
         let added = currentPaths.subtracting(previousPaths)
         let removed = previousPaths.subtracting(currentPaths)
+        let health = modelHealthSummary(catalog: catalog, repoRoot: repoRoot)
 
         modelSummaryItem.title = "Models: \(catalog.totalCount) files | \(formatBytes(catalog.totalSizeBytes))"
 
@@ -1670,6 +2042,13 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
 
         let families = catalog.extensionCounts.prefix(3).map { "\($0.0):\($0.1)" }.joined(separator: ", ")
         lines.append(families.isEmpty ? "Families: none" : "Families: \(families)")
+        let bucketLine = health.sizeBucketCounts
+            .sorted { lhs, rhs in lhs.key < rhs.key }
+            .map { "\($0.key):\($0.value)" }
+            .joined(separator: ", ")
+        lines.append(bucketLine.isEmpty ? "Sizes: n/a" : "Sizes: \(bucketLine)")
+        lines.append("New: 24h \(health.new24h) | 7d \(health.new7d)")
+        lines.append("Health: missing tokenizer \(health.missingTokenizer), config \(health.missingConfig)")
 
         if !added.isEmpty {
             let addedPreview = added.sorted().prefix(2).map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")
@@ -1709,19 +2088,24 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         upstreamRefreshInFlight = true
         let root = repoRoot
         DispatchQueue.global(qos: .utility).async {
+            if force {
+                _ = runShellCommand("git -C \(shellQuote(root)) fetch --quiet origin main")
+            }
             let head = readGitHeadInfo(in: root)
             let dirty = readGitDirty(in: root)
+            let sync = readGitAheadBehind(in: root)
             DispatchQueue.main.async { [weak self] in
-                self?.applyUpstreamInfo(head: head, dirty: dirty, force: force)
+                self?.applyUpstreamInfo(head: head, dirty: dirty, sync: sync, force: force)
                 self?.upstreamRefreshInFlight = false
             }
         }
     }
 
-    private func applyUpstreamInfo(head: GitHeadInfo?, dirty: Bool, force: Bool) {
+    private func applyUpstreamInfo(head: GitHeadInfo?, dirty: Bool, sync: (ahead: Int, behind: Int)?, force: Bool) {
         guard let head else {
             upstreamHeadItem.title = "HEAD: unavailable"
             upstreamMetaItem.title = "Repo status: not a git repository"
+            upstreamSyncItem.title = "Sync: unavailable"
             return
         }
 
@@ -1731,11 +2115,174 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         relativeFormatter.unitsStyle = .short
         let ageText = relativeFormatter.localizedString(for: head.timestamp, relativeTo: Date())
         upstreamMetaItem.title = "Repo: \(dirty ? "dirty" : "clean") | \(ageText)"
+        if let sync {
+            upstreamSyncItem.title = "Sync: ahead \(sync.ahead) | behind \(sync.behind)"
+        } else {
+            upstreamSyncItem.title = "Sync: no remote info"
+        }
 
         if let lastSeenRepoSHA, lastSeenRepoSHA != head.shortSHA, !force {
             statusLineItem.title = "Status: repo head changed to \(head.shortSHA)"
         }
         lastSeenRepoSHA = head.shortSHA
+    }
+
+    private func runDueQueueIfNeeded() {
+        guard process == nil else {
+            return
+        }
+        guard let next = queueStore.duePending() else {
+            return
+        }
+        guard let preset = RunPreset(rawValue: next.preset) else {
+            queueStore.markFinished(id: next.id, exitCode: 1)
+            refreshQueueSummary()
+            return
+        }
+        if let reason = guardrailBlockReason(for: preset) {
+            queueSummaryItem.title = "Queue blocked: \(reason)"
+            return
+        }
+        queueStore.markRunning(id: next.id)
+        refreshQueueSummary()
+        runPreset(preset, queueItemID: next.id)
+    }
+
+    private func refreshQueueSummary() {
+        let pending = queueStore.items.filter { $0.state == "pending" }
+        if pending.isEmpty {
+            queueSummaryItem.title = "Queue: 0 pending"
+            return
+        }
+        let sorted = pending.sorted { $0.scheduledAt < $1.scheduledAt }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        let nextLabel = formatter.localizedString(for: sorted[0].scheduledAt, relativeTo: Date())
+        queueSummaryItem.title = "Queue: \(pending.count) pending | next \(nextLabel)"
+    }
+
+    private func guardrailBlockReason(for preset: RunPreset) -> String? {
+        if preset == .fast {
+            return nil
+        }
+        let thermal = ProcessInfo.processInfo.thermalState
+        if thermal == .serious || thermal == .critical {
+            return "thermal \(thermalLabel(thermal))"
+        }
+        let battery = readBatteryStatus()
+        if let percent = battery.percent, !battery.isCharging, percent < 30 {
+            return "battery \(percent)% and unplugged"
+        }
+        return nil
+    }
+
+    private func refreshGuardrailLine() {
+        let battery = readBatteryStatus()
+        let thermal = ProcessInfo.processInfo.thermalState
+        let batteryText: String
+        if let percent = battery.percent {
+            batteryText = "\(percent)%\(battery.isCharging ? " charging" : " battery")"
+        } else {
+            batteryText = "unknown battery"
+        }
+        guardrailItem.title = "Guardrails: \(batteryText) | thermal \(thermalLabel(thermal))"
+    }
+
+    @objc private func exportReproBundle() {
+        let base = historyStore.baseDirectory.appendingPathComponent("exports", isDirectory: true)
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let outDir = base.appendingPathComponent("run-\(stamp)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        } catch {
+            statusLineItem.title = "Status: export failed (mkdir)"
+            return
+        }
+
+        let latestRun = historyStore.recent(limit: 1).first
+        let summaryFile = writeBenchmarkSummaryFile()
+        let metadata: [String: Any] = [
+            "exported_at": ISO8601DateFormatter().string(from: Date()),
+            "repo_root": repoRoot,
+            "repo_head": lastSeenRepoSHA as Any,
+            "latest_run": [
+                "id": latestRun?.id as Any,
+                "mode": latestRun?.mode as Any,
+                "exit_code": latestRun?.exitCode as Any,
+                "duration_seconds": latestRun?.durationSeconds as Any,
+                "ane_tflops": latestRun?.aneTFLOPS as Any,
+                "ane_utilization": latestRun?.aneUtilization as Any,
+                "avg_train_ms": latestRun?.avgTrainMS as Any,
+            ],
+            "queue_pending": queueStore.pendingCount(),
+            "history_file": historyStore.fileURL.path,
+            "benchmark_summary_file": summaryFile.path,
+        ]
+
+        let metadataURL = outDir.appendingPathComponent("metadata.json")
+        if let data = try? JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: metadataURL, options: .atomic)
+        }
+
+        let notes = """
+        # ANEbar Repro Bundle
+
+        - Exported: \(ISO8601DateFormatter().string(from: Date()))
+        - Repo: \(repoRoot)
+        - HEAD: \(lastSeenRepoSHA ?? "unknown")
+        - Run history: \(historyStore.fileURL.path)
+        - Benchmark summary: \(summaryFile.path)
+        """
+        try? notes.write(to: outDir.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+
+        NSWorkspace.shared.open(outDir)
+        statusLineItem.title = "Status: exported repro bundle"
+    }
+
+    @objc private func openBenchmarkSummary() {
+        let url = writeBenchmarkSummaryFile()
+        NSWorkspace.shared.open(url)
+    }
+
+    private func writeBenchmarkSummaryFile() -> URL {
+        let url = historyStore.baseDirectory.appendingPathComponent("benchmark_summary.md")
+        var lines: [String] = []
+        lines.append("# ANEbar Benchmark Summary")
+        lines.append("")
+        lines.append("Generated: \(ISO8601DateFormatter().string(from: Date()))")
+        lines.append("")
+
+        let runs = historyStore.records.filter { $0.exitCode == 0 }
+        if runs.isEmpty {
+            lines.append("No successful runs yet.")
+            try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+            return url
+        }
+
+        let bestTFLOPS = runs.compactMap(\.aneTFLOPS).max()
+        let bestUtil = runs.compactMap(\.aneUtilization).max()
+        let bestLatency = runs.compactMap(\.avgTrainMS).min()
+
+        lines.append("- Successful runs: \(runs.count)")
+        lines.append(bestTFLOPS != nil ? String(format: "- Best ANE TFLOPS: %.2f", bestTFLOPS!) : "- Best ANE TFLOPS: n/a")
+        lines.append(bestUtil != nil ? String(format: "- Best Utilization: %.2f%%", bestUtil!) : "- Best Utilization: n/a")
+        lines.append(bestLatency != nil ? String(format: "- Best Avg Train: %.2fms", bestLatency!) : "- Best Avg Train: n/a")
+        lines.append("")
+        lines.append("| Ended | Mode | Head | ANE TFLOPS | Util % | Avg ms |")
+        lines.append("|---|---|---|---:|---:|---:|")
+
+        let formatter = ISO8601DateFormatter()
+        for run in runs.suffix(20) {
+            let ended = formatter.string(from: run.endedAt)
+            let tflops = run.aneTFLOPS.map { String(format: "%.2f", $0) } ?? "-"
+            let util = run.aneUtilization.map { String(format: "%.2f", $0) } ?? "-"
+            let avg = run.avgTrainMS.map { String(format: "%.2f", $0) } ?? "-"
+            let head = run.repoHead ?? "-"
+            lines.append("| \(ended) | \(run.mode) | \(head) | \(tflops) | \(util) | \(avg) |")
+        }
+
+        try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        return url
     }
 
     private func refreshRunHistoryLines() {
