@@ -1,0 +1,5 @@
+# SwiftPM build outputs
+apps/ANEBar/.build/
+
+# macOS
+.DS_Store
