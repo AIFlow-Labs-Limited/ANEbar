@@ -1,0 +1,245 @@
+{
+  "builtTestProducts" : [
+
+  ],
+  "copyCommands" : {
+
+  },
+  "explicitTargetDependencyImportCheckingMode" : {
+    "none" : {
+
+    }
+  },
+  "generatedSourceTargetSet" : [
+
+  ],
+  "pluginDescriptions" : [
+
+  ],
+  "swiftCommands" : {
+    "C.ANEBar-arm64-apple-macosx26.0-debug.module" : {
+      "executable" : "/Library/Developer/CommandLineTools/usr/bin/swiftc",
+      "fileList" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/sources",
+      "importPath" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Sources/ANEBar/main.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/sources"
+        }
+      ],
+      "isLibrary" : false,
+      "moduleName" : "ANEBar",
+      "moduleOutputPath" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/Modules/ANEBar.swiftmodule",
+      "objects" : [
+        "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/main.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx14.0",
+        "-incremental",
+        "-enable-batch-mode",
+        "-serialize-diagnostics",
+        "-index-store-path",
+        "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ModuleCache",
+        "-parseable-output",
+        "-Xfrontend",
+        "-entry-point-function-name",
+        "-Xfrontend",
+        "ANEBar_main",
+        "-parse-as-library",
+        "-swift-version",
+        "6",
+        "-enable-upcoming-feature",
+        "StrictConcurrency",
+        "-I",
+        "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+        "-L",
+        "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+        "-plugin-path",
+        "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "-g",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "anebar"
+      ],
+      "outputFileMapPath" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/main.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/Modules/ANEBar.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Sources/ANEBar/main.swift"
+      ],
+      "tempsPath" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build",
+      "wholeModuleOptimization" : false
+    }
+  },
+  "swiftFrontendCommands" : {
+
+  },
+  "swiftTargetScanArgs" : {
+    "ANEBar" : [
+      "/Library/Developer/CommandLineTools/usr/bin/swiftc",
+      "-module-name",
+      "ANEBar",
+      "-package-name",
+      "anebar",
+      "-c",
+      "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Sources/ANEBar/main.swift",
+      "-I",
+      "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/Modules",
+      "-target",
+      "arm64-apple-macosx14.0",
+      "-incremental",
+      "-enable-batch-mode",
+      "-serialize-diagnostics",
+      "-index-store-path",
+      "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ModuleCache",
+      "-parseable-output",
+      "-Xfrontend",
+      "-entry-point-function-name",
+      "-Xfrontend",
+      "ANEBar_main",
+      "-parse-as-library",
+      "-swift-version",
+      "6",
+      "-enable-upcoming-feature",
+      "StrictConcurrency",
+      "-I",
+      "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+      "-L",
+      "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+      "-plugin-path",
+      "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-g",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "anebar",
+      "-driver-use-frontend-path",
+      "/Library/Developer/CommandLineTools/usr/bin/swiftc"
+    ]
+  },
+  "targetDependencyMap" : {
+    "ANEBar" : [
+
+    ]
+  },
+  "testDiscoveryCommands" : {
+
+  },
+  "testEntryPointCommands" : {
+
+  },
+  "traitConfiguration" : {
+    "default" : {
+
+    }
+  },
+  "writeCommands" : {
+    "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar-entitlement.plist" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<entitlement-plist>"
+        },
+        {
+          "kind" : "virtual",
+          "name" : "<com.apple.security.get-task-allow>"
+        }
+      ],
+      "outputFilePath" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar-entitlement.plist"
+    },
+    "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Sources/ANEBar/main.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/sources"
+    },
+    "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.product/Objects.LinkFileList" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<link-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/main.swift.o"
+        }
+      ],
+      "outputFilePath" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.product/Objects.LinkFileList"
+    },
+    "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt" : {
+      "alwaysOutOfDate" : true,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<swift-get-version>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Library/Developer/CommandLineTools/usr/bin/swiftc"
+        }
+      ],
+      "outputFilePath" : "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt"
+    }
+  }
+}

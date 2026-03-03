@@ -1,0 +1,81 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "ANEBar-arm64-apple-macosx26.0-debug.exe": ["<ANEBar-arm64-apple-macosx26.0-debug.exe>"]
+  "ANEBar-arm64-apple-macosx26.0-debug.module": ["<ANEBar-arm64-apple-macosx26.0-debug.module>"]
+  "PackageStructure": ["<PackageStructure>"]
+  "main": ["<ANEBar-arm64-apple-macosx26.0-debug.exe>","<ANEBar-arm64-apple-macosx26.0-debug.module>"]
+  "test": ["<ANEBar-arm64-apple-macosx26.0-debug.exe>","<ANEBar-arm64-apple-macosx26.0-debug.module>"]
+default: "main"
+nodes:
+  "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Sources/ANEBar/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar":
+    is-mutated: true
+commands:
+  "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar-entitlement.plist":
+    tool: write-auxiliary-file
+    inputs: ["<entitlement-plist>","<com.apple.security.get-task-allow>"]
+    outputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar-entitlement.plist"]
+    description: "Write auxiliary file /Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar-entitlement.plist"
+
+  "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Sources/ANEBar/main.swift"]
+    outputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/sources"]
+    description: "Write auxiliary file /Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/sources"
+
+  "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.product/Objects.LinkFileList":
+    tool: write-auxiliary-file
+    inputs: ["<link-file-list>","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/main.swift.o"]
+    outputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.product/Objects.LinkFileList"]
+    description: "Write auxiliary file /Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.product/Objects.LinkFileList"
+
+  "/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Library/Developer/CommandLineTools/usr/bin/swiftc"]
+    outputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt"
+
+  "<ANEBar-arm64-apple-macosx26.0-debug.exe>":
+    tool: phony
+    inputs: ["<ANEBar-arm64-apple-macosx26.0-debug.exe-CodeSigning>"]
+    outputs: ["<ANEBar-arm64-apple-macosx26.0-debug.exe>"]
+
+  "<ANEBar-arm64-apple-macosx26.0-debug.module>":
+    tool: phony
+    inputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/main.swift.o","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/Modules/ANEBar.swiftmodule"]
+    outputs: ["<ANEBar-arm64-apple-macosx26.0-debug.module>"]
+
+  "C.ANEBar-arm64-apple-macosx26.0-debug.exe":
+    tool: shell
+    inputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/main.swift.o","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.product/Objects.LinkFileList"]
+    outputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar"]
+    description: "Linking ./.build/arm64-apple-macosx/debug/ANEBar"
+    args: ["/Library/Developer/CommandLineTools/usr/bin/swiftc","-L","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug","-o","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar","-module-name","ANEBar","-Xlinker","-no_warn_duplicate_libraries","-emit-executable","-Xlinker","-alias","-Xlinker","_ANEBar_main","-Xlinker","_main","-Xlinker","-rpath","-Xlinker","@loader_path","@/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.product/Objects.LinkFileList","-Xlinker","-rpath","-Xlinker","/Library/Developer/CommandLineTools/usr/lib/swift-6.2/macosx","-target","arm64-apple-macosx14.0","-Xlinker","-add_ast_path","-Xlinker","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/Modules/ANEBar.swiftmodule","-I","/Library/Developer/CommandLineTools/Library/Developer/Frameworks","-L","/Library/Developer/CommandLineTools/Library/Developer/Frameworks","-plugin-path","/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing","-sdk","/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk","-g"]
+
+  "C.ANEBar-arm64-apple-macosx26.0-debug.exe-entitlements":
+    tool: shell
+    inputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar-entitlement.plist"]
+    outputs: ["<ANEBar-arm64-apple-macosx26.0-debug.exe-CodeSigning>"]
+    description: "Applying debug entitlements to ./.build/arm64-apple-macosx/debug/ANEBar"
+    args: ["codesign","--force","--sign","-","--entitlements","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar-entitlement.plist","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar"]
+
+  "C.ANEBar-arm64-apple-macosx26.0-debug.module":
+    tool: shell
+    inputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Sources/ANEBar/main.swift","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/sources"]
+    outputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/main.swift.o","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/Modules/ANEBar.swiftmodule"]
+    description: "Compiling Swift Module 'ANEBar' (1 sources)"
+    args: ["/Library/Developer/CommandLineTools/usr/bin/swiftc","-module-name","ANEBar","-emit-dependencies","-emit-module","-emit-module-path","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/Modules/ANEBar.swiftmodule","-output-file-map","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/output-file-map.json","-incremental","-c","@/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ANEBar.build/sources","-I","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/Modules","-target","arm64-apple-macosx14.0","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/index/store","-Onone","-enable-testing","-j10","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-module-cache-path","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/.build/arm64-apple-macosx/debug/ModuleCache","-parseable-output","-Xfrontend","-entry-point-function-name","-Xfrontend","ANEBar_main","-parse-as-library","-swift-version","6","-enable-upcoming-feature","StrictConcurrency","-I","/Library/Developer/CommandLineTools/Library/Developer/Frameworks","-L","/Library/Developer/CommandLineTools/Library/Developer/Frameworks","-plugin-path","/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing","-sdk","/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk","-g","-Xcc","-isysroot","-Xcc","/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk","-Xcc","-fPIC","-Xcc","-g","-package-name","anebar"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Sources/ANEBar/","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Package.swift","/Users/ilessio/Development/AIFLOWLABS/deep_learning/ANEbar/apps/ANEBar/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+

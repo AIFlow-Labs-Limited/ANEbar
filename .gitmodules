@@ -1,0 +1,4 @@
+[submodule "upstream/ANE"]
+	path = upstream/ANE
+	url = https://github.com/maderix/ANE.git
+	branch = main
