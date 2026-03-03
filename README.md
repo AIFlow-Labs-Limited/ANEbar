@@ -18,6 +18,11 @@ It is built for daily research + social publishing workflows: run experiments, m
   - E-core usage
   - memory usage
   - ANE utilization and TFLOPS (when emitted by the pipeline)
+  - fallback extraction from research result files when stdout metrics are absent
+- Local chat panel:
+  - model selector
+  - streaming responses
+  - built around local `ollama` runtime
 - Model tracker:
   - continuously scans the selected ANE repo
   - tracks common model artifact types (`.safetensors`, `.gguf`, `.onnx`, `.mlmodel`, `.mlpackage`, `.pt`, `.pth`, `.bin`)

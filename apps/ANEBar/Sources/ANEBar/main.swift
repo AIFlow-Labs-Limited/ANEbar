@@ -14,6 +14,662 @@ private struct LiveMetricsSample {
     var runActive: Bool
 }
 
+private struct ModelArtifact {
+    var relativePath: String
+    var fileExtension: String
+    var sizeBytes: UInt64
+    var modifiedAt: Date?
+}
+
+private struct ModelCatalog {
+    var artifacts: [ModelArtifact]
+
+    var totalCount: Int {
+        artifacts.count
+    }
+
+    var totalSizeBytes: UInt64 {
+        artifacts.reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    var extensionCounts: [(String, Int)] {
+        var counts: [String: Int] = [:]
+        for artifact in artifacts {
+            counts[artifact.fileExtension, default: 0] += 1
+        }
+        return counts.sorted { lhs, rhs in
+            if lhs.value == rhs.value {
+                return lhs.key < rhs.key
+            }
+            return lhs.value > rhs.value
+        }
+    }
+
+    func newest(limit: Int) -> [ModelArtifact] {
+        artifacts
+            .sorted { lhs, rhs in
+                let left = lhs.modifiedAt ?? .distantPast
+                let right = rhs.modifiedAt ?? .distantPast
+                if left == right {
+                    return lhs.relativePath < rhs.relativePath
+                }
+                return left > right
+            }
+            .prefix(limit)
+            .map { $0 }
+    }
+}
+
+private struct GitHeadInfo {
+    var shortSHA: String
+    var timestamp: Date
+    var subject: String
+}
+
+private struct RunRecord: Codable {
+    var id: String
+    var mode: String
+    var command: String
+    var repoRoot: String
+    var repoHead: String?
+    var startedAt: Date
+    var endedAt: Date
+    var durationSeconds: Double
+    var exitCode: Int32
+    var aneUtilization: Double?
+    var aneTFLOPS: Double?
+    var totalTFLOPS: Double?
+    var avgTrainMS: Double?
+}
+
+private final class RunHistoryStore {
+    let fileURL: URL
+    private(set) var records: [RunRecord] = []
+    private let maxRecords = 500
+
+    init() {
+        let fileManager = FileManager.default
+        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let directory = appSupport.appendingPathComponent("ANEBar", isDirectory: true)
+        fileURL = directory.appendingPathComponent("run_history.json")
+
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            // Ignore and continue with best-effort persistence.
+        }
+
+        load()
+    }
+
+    func append(_ record: RunRecord) {
+        records.append(record)
+        if records.count > maxRecords {
+            records.removeFirst(records.count - maxRecords)
+        }
+        save()
+    }
+
+    func recent(limit: Int) -> [RunRecord] {
+        Array(records.suffix(limit))
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            records = []
+            return
+        }
+        do {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            records = try decoder.decode([RunRecord].self, from: data)
+        } catch {
+            records = []
+        }
+    }
+
+    private func save() {
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(records)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            // Ignore save failures; this should never crash the app.
+        }
+    }
+}
+
+private enum RunPreset: String {
+    case fast
+    case full
+    case benchmark
+
+    var displayTitle: String {
+        switch self {
+        case .fast:
+            return "fast"
+        case .full:
+            return "full"
+        case .benchmark:
+            return "benchmark"
+        }
+    }
+
+    var menuTitle: String {
+        switch self {
+        case .fast:
+            return "Run Fast Preset"
+        case .full:
+            return "Run Full Preset"
+        case .benchmark:
+            return "Run Benchmark Preset"
+        }
+    }
+}
+
+private func shellQuote(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+private func runShellCommand(_ command: String) -> (status: Int32, output: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["-lc", command]
+
+    let outputPipe = Pipe()
+    process.standardOutput = outputPipe
+    process.standardError = outputPipe
+
+    do {
+        try process.run()
+    } catch {
+        return (status: 1, output: "")
+    }
+
+    process.waitUntilExit()
+    let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+    let text = String(data: data, encoding: .utf8) ?? ""
+    return (status: process.terminationStatus, output: text)
+}
+
+private func readGitHeadInfo(in repoRoot: String) -> GitHeadInfo? {
+    let quoted = shellQuote(repoRoot)
+    let command = "git -C \(quoted) log -1 --pretty=%h\\|%ct\\|%s"
+    let result = runShellCommand(command)
+    guard result.status == 0 else {
+        return nil
+    }
+    let line = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    let components = line.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+    guard components.count == 3,
+          let epoch = TimeInterval(components[1])
+    else {
+        return nil
+    }
+    return GitHeadInfo(
+        shortSHA: String(components[0]),
+        timestamp: Date(timeIntervalSince1970: epoch),
+        subject: String(components[2])
+    )
+}
+
+private func readGitDirty(in repoRoot: String) -> Bool {
+    let quoted = shellQuote(repoRoot)
+    let command = "git -C \(quoted) status --porcelain"
+    let result = runShellCommand(command)
+    guard result.status == 0 else {
+        return false
+    }
+    return !result.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+}
+
+private func discoverModelCatalog(in repoRoot: String) -> ModelCatalog {
+    let fileManager = FileManager.default
+    let rootURL = URL(fileURLWithPath: repoRoot, isDirectory: true)
+
+    let modelExtensions: Set<String> = [
+        "bin",
+        "ckpt",
+        "gguf",
+        "mlmodel",
+        "mlpackage",
+        "npz",
+        "onnx",
+        "pt",
+        "pth",
+        "safetensors",
+        "tflite",
+    ]
+
+    let skipDirectories: Set<String> = [
+        ".build",
+        ".git",
+        ".private",
+        "build",
+        "dist",
+        "node_modules",
+        "venv",
+        ".venv",
+    ]
+
+    var artifacts: [ModelArtifact] = []
+
+    guard let enumerator = fileManager.enumerator(
+        at: rootURL,
+        includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return ModelCatalog(artifacts: [])
+    }
+
+    while let url = enumerator.nextObject() as? URL {
+        let relativePath = url.path.replacingOccurrences(of: rootURL.path + "/", with: "")
+        let components = Set(relativePath.split(separator: "/").map(String.init))
+
+        if !components.isDisjoint(with: skipDirectories) {
+            if let values = try? url.resourceValues(forKeys: [.isDirectoryKey]), values.isDirectory == true {
+                enumerator.skipDescendants()
+            }
+            continue
+        }
+
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey])
+        let isDirectory = values?.isDirectory == true
+        let isRegularFile = values?.isRegularFile == true
+
+        if isDirectory, url.pathExtension.lowercased() == "mlpackage" {
+            artifacts.append(
+                ModelArtifact(
+                    relativePath: relativePath,
+                    fileExtension: "mlpackage",
+                    sizeBytes: 0,
+                    modifiedAt: values?.contentModificationDate
+                )
+            )
+            enumerator.skipDescendants()
+            continue
+        }
+
+        guard isRegularFile else {
+            continue
+        }
+
+        let ext = url.pathExtension.lowercased()
+        guard modelExtensions.contains(ext) else {
+            continue
+        }
+
+        let size = UInt64(max(0, values?.fileSize ?? 0))
+        artifacts.append(
+            ModelArtifact(
+                relativePath: relativePath,
+                fileExtension: ext,
+                sizeBytes: size,
+                modifiedAt: values?.contentModificationDate
+            )
+        )
+    }
+
+    artifacts.sort { $0.relativePath < $1.relativePath }
+    return ModelCatalog(artifacts: artifacts)
+}
+
+private func formatBytes(_ bytes: UInt64) -> String {
+    let formatter = ByteCountFormatter()
+    formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
+    formatter.countStyle = .file
+    formatter.includesUnit = true
+    formatter.includesCount = true
+    return formatter.string(fromByteCount: Int64(bytes))
+}
+
+private func truncate(_ text: String, maxLength: Int) -> String {
+    guard text.count > maxLength else {
+        return text
+    }
+    let end = text.index(text.startIndex, offsetBy: max(0, maxLength - 1))
+    return String(text[..<end]) + "…"
+}
+
+private func formatDuration(_ seconds: Double) -> String {
+    let duration = max(0, Int(seconds.rounded()))
+    let minutes = duration / 60
+    let remainingSeconds = duration % 60
+    return String(format: "%dm %02ds", minutes, remainingSeconds)
+}
+
+private func formatSigned(_ value: Double, suffix: String = "") -> String {
+    let sign = value >= 0 ? "+" : ""
+    return String(format: "%@%.2f%@", sign, value, suffix)
+}
+
+private struct ResearchSummarySnapshot {
+    var aneTFLOPS: Double?
+    var aneUtilization: Double?
+    var avgStepMS: Double?
+}
+
+private func parseResearchSummary(in repoRoot: String) -> ResearchSummarySnapshot? {
+    let csvPath = "\(repoRoot)/training/research/results/data/qos_summary.csv"
+    guard let csvText = try? String(contentsOfFile: csvPath, encoding: .utf8) else {
+        let probePath = "\(repoRoot)/training/research/results/data/probe_summary.json"
+        guard let probeData = try? Data(contentsOf: URL(fileURLWithPath: probePath)),
+              let json = try? JSONSerialization.jsonObject(with: probeData) as? [String: Any],
+              let kernelMFLOPS = json["kernel_mflops"] as? Double
+        else {
+            return nil
+        }
+        let tflops = kernelMFLOPS / 1000.0
+        let peakTFLOPS = Double(ProcessInfo.processInfo.environment["ANE_PEAK_TFLOPS"] ?? "") ?? 15.8
+        let util = peakTFLOPS > 0 ? (tflops / peakTFLOPS) * 100.0 : nil
+        return ResearchSummarySnapshot(aneTFLOPS: tflops, aneUtilization: util, avgStepMS: nil)
+    }
+
+    let lines = csvText
+        .split(whereSeparator: \.isNewline)
+        .map(String.init)
+        .filter { !$0.isEmpty }
+    guard lines.count >= 2 else {
+        return nil
+    }
+
+    let headers = lines[0].split(separator: ",").map(String.init)
+    guard let evalIndex = headers.firstIndex(of: "eval_avg_ms_mean"),
+          let throughputIndex = headers.firstIndex(of: "throughput_gflops_mean")
+    else {
+        return nil
+    }
+
+    var bestEvalMS: Double?
+    var bestThroughputGFLOPS: Double?
+
+    for line in lines.dropFirst() {
+        let columns = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        guard columns.count > max(evalIndex, throughputIndex),
+              let evalMS = Double(columns[evalIndex]),
+              let throughput = Double(columns[throughputIndex])
+        else {
+            continue
+        }
+
+        if bestEvalMS == nil || evalMS < (bestEvalMS ?? .greatestFiniteMagnitude) {
+            bestEvalMS = evalMS
+            bestThroughputGFLOPS = throughput
+        }
+    }
+
+    guard let throughput = bestThroughputGFLOPS else {
+        return nil
+    }
+
+    let aneTFLOPS = throughput / 1000.0
+    let peakTFLOPS = Double(ProcessInfo.processInfo.environment["ANE_PEAK_TFLOPS"] ?? "") ?? 15.8
+    let aneUtil = peakTFLOPS > 0 ? (aneTFLOPS / peakTFLOPS) * 100.0 : nil
+    return ResearchSummarySnapshot(
+        aneTFLOPS: aneTFLOPS,
+        aneUtilization: aneUtil,
+        avgStepMS: bestEvalMS
+    )
+}
+
+@MainActor
+private final class ChatWindowController: NSWindowController {
+    private enum DefaultsKey {
+        static let chatModel = "anebar_chat_model"
+    }
+
+    private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let promptField = NSTextField()
+    private let sendButton = NSButton(title: "Send", target: nil, action: nil)
+    private let stopButton = NSButton(title: "Stop", target: nil, action: nil)
+    private let refreshButton = NSButton(title: "Refresh Models", target: nil, action: nil)
+    private let clearButton = NSButton(title: "Clear", target: nil, action: nil)
+    private let statusLabel = NSTextField(labelWithString: "Local chat ready")
+    private let outputTextView = NSTextView(frame: .zero)
+
+    private var chatProcess: Process?
+    private var fallbackModels: [String] = []
+
+    override init(window: NSWindow?) {
+        let initialRect = NSRect(x: 0, y: 0, width: 680, height: 520)
+        let window = NSWindow(
+            contentRect: initialRect,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "ANEbar Local Chat"
+        window.minSize = NSSize(width: 560, height: 420)
+        super.init(window: window)
+        setupUI()
+        reloadModels(preserveSelection: true)
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    func setFallbackModels(_ models: [String]) {
+        fallbackModels = Array(Set(models)).sorted()
+        if modelPopup.numberOfItems == 0 {
+            reloadModels(preserveSelection: true)
+        }
+    }
+
+    private func setupUI() {
+        guard let contentView = window?.contentView else {
+            return
+        }
+
+        let titleLabel = NSTextField(labelWithString: "Model")
+        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        modelPopup.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+
+        promptField.placeholderString = "Prompt (press Enter or click Send)"
+        promptField.font = .systemFont(ofSize: 13)
+        promptField.target = self
+        promptField.action = #selector(sendPrompt)
+
+        sendButton.target = self
+        sendButton.action = #selector(sendPrompt)
+        sendButton.keyEquivalent = "\r"
+
+        stopButton.target = self
+        stopButton.action = #selector(stopChat)
+        stopButton.isEnabled = false
+
+        refreshButton.target = self
+        refreshButton.action = #selector(refreshModels)
+
+        clearButton.target = self
+        clearButton.action = #selector(clearOutput)
+
+        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+
+        outputTextView.isEditable = false
+        outputTextView.isSelectable = true
+        outputTextView.isRichText = false
+        outputTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        outputTextView.string = "ANEbar local chat. Select a small model and start chatting.\n"
+        outputTextView.textColor = .labelColor
+        outputTextView.backgroundColor = .textBackgroundColor
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = true
+        scrollView.documentView = outputTextView
+
+        let controlsStack = NSStackView(views: [
+            titleLabel, modelPopup, refreshButton, stopButton, clearButton,
+        ])
+        controlsStack.orientation = .horizontal
+        controlsStack.spacing = 10
+        controlsStack.alignment = .centerY
+        controlsStack.distribution = .gravityAreas
+        modelPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        modelPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let promptStack = NSStackView(views: [promptField, sendButton])
+        promptStack.orientation = .horizontal
+        promptStack.spacing = 10
+        promptStack.alignment = .centerY
+
+        let root = NSStackView(views: [controlsStack, promptStack, scrollView, statusLabel])
+        root.orientation = .vertical
+        root.spacing = 10
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        contentView.addSubview(root)
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 14),
+            root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -14),
+            root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 14),
+            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -14),
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 280),
+        ])
+    }
+
+    private func discoverOllamaModels() -> [String] {
+        let result = runShellCommand("ollama list")
+        guard result.status == 0 else {
+            return []
+        }
+        let rows = result.output
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .dropFirst()
+        var models: [String] = []
+        for row in rows {
+            let trimmed = row.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                continue
+            }
+            let parts = trimmed.split(whereSeparator: \.isWhitespace)
+            if let first = parts.first {
+                models.append(String(first))
+            }
+        }
+        return Array(Set(models)).sorted()
+    }
+
+    @objc private func refreshModels() {
+        reloadModels(preserveSelection: true)
+    }
+
+    private func reloadModels(preserveSelection: Bool) {
+        let previous = preserveSelection ? modelPopup.titleOfSelectedItem : nil
+        let discovered = discoverOllamaModels()
+        let defaults = ["qwen2.5:0.5b", "qwen2.5:1.5b", "phi3:mini", "llama3.2:1b"]
+        let merged = discovered.isEmpty ? Array(Set(defaults + fallbackModels)).sorted() : discovered
+
+        modelPopup.removeAllItems()
+        if merged.isEmpty {
+            statusLabel.stringValue = "No models discovered. Install Ollama and pull a small model."
+            return
+        }
+        modelPopup.addItems(withTitles: merged)
+
+        if let previous, merged.contains(previous) {
+            modelPopup.selectItem(withTitle: previous)
+        } else if let saved = UserDefaults.standard.string(forKey: DefaultsKey.chatModel), merged.contains(saved) {
+            modelPopup.selectItem(withTitle: saved)
+        } else if let first = merged.first {
+            modelPopup.selectItem(withTitle: first)
+        }
+
+        if discovered.isEmpty {
+            statusLabel.stringValue = "No local Ollama model found. Pull one (e.g. ollama pull qwen2.5:0.5b)."
+        } else {
+            statusLabel.stringValue = "Ready. Streaming from local Ollama runtime."
+        }
+    }
+
+    @objc private func clearOutput() {
+        outputTextView.string = ""
+    }
+
+    @objc private func sendPrompt() {
+        guard chatProcess == nil else {
+            return
+        }
+        let prompt = promptField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else {
+            statusLabel.stringValue = "Enter a prompt first."
+            return
+        }
+
+        guard let model = modelPopup.titleOfSelectedItem, !model.isEmpty else {
+            statusLabel.stringValue = "Select a model first."
+            return
+        }
+
+        UserDefaults.standard.set(model, forKey: DefaultsKey.chatModel)
+        promptField.stringValue = ""
+
+        appendOutput("\nYou: \(prompt)\nAssistant: ")
+
+        let command = "ollama run \(shellQuote(model)) \(shellQuote(prompt))"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-lc", command]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else {
+                return
+            }
+            Task { @MainActor in
+                self?.appendOutput(text)
+            }
+        }
+
+        process.terminationHandler = { [weak self, weak pipe] proc in
+            Task { @MainActor in
+                pipe?.fileHandleForReading.readabilityHandler = nil
+                self?.chatProcess = nil
+                self?.sendButton.isEnabled = true
+                self?.stopButton.isEnabled = false
+                if proc.terminationStatus == 0 {
+                    self?.statusLabel.stringValue = "Completed."
+                    self?.appendOutput("\n")
+                } else {
+                    self?.statusLabel.stringValue = "Chat command failed (\(proc.terminationStatus))."
+                    self?.appendOutput("\n\n[chat failed]\n")
+                }
+            }
+        }
+
+        do {
+            try process.run()
+            chatProcess = process
+            sendButton.isEnabled = false
+            stopButton.isEnabled = true
+            statusLabel.stringValue = "Streaming response..."
+        } catch {
+            chatProcess = nil
+            statusLabel.stringValue = "Could not launch ollama. Is it installed/running?"
+            appendOutput("\n[launch failed: \(error.localizedDescription)]\n")
+        }
+    }
+
+    @objc private func stopChat() {
+        chatProcess?.terminate()
+    }
+
+    private func appendOutput(_ text: String) {
+        outputTextView.textStorage?.append(NSAttributedString(string: text))
+        outputTextView.scrollToEndOfDocument(nil)
+    }
+}
+
 private final class SystemMetricsSampler {
     private var previousTicks: [[UInt64]]?
     private let configuredPCoreCount: Int
@@ -111,7 +767,8 @@ private final class SystemMetricsSampler {
         guard total > 0 else {
             return 0
         }
-        return clampPercent((used / total) * 100.0)
+
+        return min(100, max(0, (used / total) * 100.0))
     }
 
     func sampleLoadAverage1m() -> Double {
@@ -148,15 +805,11 @@ private final class SystemMetricsSampler {
         }
         return Int(value)
     }
-
-    private func clampPercent(_ value: Double) -> Double {
-        min(100, max(0, value))
-    }
 }
 
 private final class LiveMetricsMenuView: NSView {
     private var history: [LiveMetricsSample] = []
-    private let maxPoints = 100
+    private let maxPoints = 120
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: 360, height: 220)
@@ -171,7 +824,10 @@ private final class LiveMetricsMenuView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let latest = history.last else { return }
+        guard let latest = history.last else {
+            return
+        }
+
         let inset = bounds.insetBy(dx: 12, dy: 10)
         let headerAttributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
@@ -216,10 +872,9 @@ private final class LiveMetricsMenuView: NSView {
         )
 
         let aneValue = latest.aneUtilization
-        let aneText = aneValue.map(percentText) ?? "n/a"
         drawProgressRow(
             label: "ANE(run)",
-            valueText: aneText,
+            valueText: aneValue.map(percentText) ?? "n/a",
             value: aneValue ?? 0,
             color: .systemGreen,
             row: 3,
@@ -277,8 +932,7 @@ private final class LiveMetricsMenuView: NSView {
         let fillRatio = CGFloat(min(100, max(0, value)) / 100.0)
         let fillRect = NSRect(x: barRect.minX, y: barRect.minY, width: barRect.width * fillRatio, height: barRect.height)
         let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 4, yRadius: 4)
-        let alpha = dimmed ? 0.25 : 0.95
-        color.withAlphaComponent(alpha).setFill()
+        color.withAlphaComponent(dimmed ? 0.25 : 0.95).setFill()
         fillPath.fill()
     }
 
@@ -311,7 +965,10 @@ private final class LiveMetricsMenuView: NSView {
     }
 
     private func drawSeries(values: [Double], color: NSColor, in rect: NSRect) {
-        guard values.count > 1 else { return }
+        guard values.count > 1 else {
+            return
+        }
+
         let stepX = rect.width / CGFloat(max(1, values.count - 1))
         let path = NSBezierPath()
 
@@ -338,71 +995,6 @@ private final class LiveMetricsMenuView: NSView {
     }
 }
 
-private func discoverModelArtifacts(in repoRoot: String) -> [String] {
-    let fileManager = FileManager.default
-    let rootURL = URL(fileURLWithPath: repoRoot, isDirectory: true)
-    let modelExtensions: Set<String> = [
-        "bin",
-        "gguf",
-        "mlmodel",
-        "mlpackage",
-        "onnx",
-        "pt",
-        "pth",
-        "safetensors",
-    ]
-    let skipDirectories: Set<String> = [
-        ".build",
-        ".git",
-        ".private",
-        "build",
-        "dist",
-    ]
-
-    var results: [String] = []
-
-    guard let enumerator = fileManager.enumerator(
-        at: rootURL,
-        includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
-        options: [.skipsHiddenFiles]
-    ) else {
-        return results
-    }
-
-    while let next = enumerator.nextObject() as? URL {
-        let relativePath = next.path.replacingOccurrences(of: rootURL.path + "/", with: "")
-        let components = Set(relativePath.split(separator: "/").map(String.init))
-        if !components.isDisjoint(with: skipDirectories) {
-            if let values = try? next.resourceValues(forKeys: [.isDirectoryKey]), values.isDirectory == true {
-                enumerator.skipDescendants()
-            }
-            continue
-        }
-
-        let values = try? next.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
-        let isDirectory = values?.isDirectory == true
-        let isRegularFile = values?.isRegularFile == true
-
-        if isDirectory, next.pathExtension.lowercased() == "mlpackage" {
-            results.append(relativePath)
-            enumerator.skipDescendants()
-            continue
-        }
-
-        guard isRegularFile else {
-            continue
-        }
-
-        let ext = next.pathExtension.lowercased()
-        if modelExtensions.contains(ext) {
-            results.append(relativePath)
-        }
-    }
-
-    results.sort()
-    return results
-}
-
 @MainActor
 final class ANEBarController: NSObject, NSApplicationDelegate {
     private enum DefaultsKey {
@@ -411,25 +1003,57 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
+
     private var runFastItem = NSMenuItem()
     private var runFullItem = NSMenuItem()
+    private var runBenchmarkItem = NSMenuItem()
+
     private var statusLineItem = NSMenuItem()
     private var repoLineItem = NSMenuItem()
+
+    private var upstreamHeadItem = NSMenuItem()
+    private var upstreamMetaItem = NSMenuItem()
+
     private var modelSummaryItem = NSMenuItem()
+    private var modelDeltaItem = NSMenuItem()
     private var modelDetailItems: [NSMenuItem] = []
+
+    private var historySummaryItem = NSMenuItem()
+    private var historyDetailItem = NSMenuItem()
+    private var historyDeltaItem = NSMenuItem()
+
     private var metricsView = LiveMetricsMenuView(frame: NSRect(x: 0, y: 0, width: 360, height: 220))
+    private var chatWindowController: ChatWindowController?
+
+    private let historyStore = RunHistoryStore()
+
     private var process: Process?
+    private var runStartedAt: Date?
+    private var currentRunPreset: RunPreset?
+    private var currentRunCommand: String?
+    private var currentRunAneUtilization: Double?
+    private var currentRunAneTFLOPS: Double?
+    private var currentRunTotalTFLOPS: Double?
+    private var currentRunAvgTrainMS: Double?
+
     private var lastExitCode: Int32?
+
     private var metricsSampler = SystemMetricsSampler()
     private var metricsTimer: Timer?
     private var latestMetrics: LiveMetricsSample?
+
     private var processOutputBuffer = ""
     private var lastANEUtilization: Double?
     private var lastANETflops: Double?
     private var lastANEUpdateAt: Date?
-    private var trackedModels: [String] = []
-    private var metricsTick: Int = 0
+
+    private var lastModelCatalog: ModelCatalog?
     private var modelRefreshInFlight = false
+
+    private var upstreamRefreshInFlight = false
+    private var lastSeenRepoSHA: String?
+
+    private var metricsTick: Int = 0
 
     private var repoRoot: String {
         get {
@@ -450,6 +1074,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         setupStatusItem()
         setupMenu()
         refreshInfoLines()
+        refreshRunHistoryLines()
         startMetricsLoop()
     }
 
@@ -489,11 +1114,29 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         repoLineItem.isEnabled = false
         menu.addItem(repoLineItem)
 
-        modelSummaryItem = NSMenuItem(title: "Models tracked: scanning…", action: nil, keyEquivalent: "")
+        upstreamHeadItem = NSMenuItem(title: "HEAD: scanning…", action: nil, keyEquivalent: "")
+        upstreamHeadItem.isEnabled = false
+        menu.addItem(upstreamHeadItem)
+
+        upstreamMetaItem = NSMenuItem(title: "Repo status: unknown", action: nil, keyEquivalent: "")
+        upstreamMetaItem.isEnabled = false
+        menu.addItem(upstreamMetaItem)
+
+        let refreshUpstreamItem = NSMenuItem(title: "Refresh Repo Head", action: #selector(refreshUpstreamManual), keyEquivalent: "u")
+        refreshUpstreamItem.target = self
+        menu.addItem(refreshUpstreamItem)
+
+        menu.addItem(.separator())
+
+        modelSummaryItem = NSMenuItem(title: "Models: scanning…", action: nil, keyEquivalent: "")
         modelSummaryItem.isEnabled = false
         menu.addItem(modelSummaryItem)
 
-        for _ in 0..<5 {
+        modelDeltaItem = NSMenuItem(title: "Model delta: baseline", action: nil, keyEquivalent: "")
+        modelDeltaItem.isEnabled = false
+        menu.addItem(modelDeltaItem)
+
+        for _ in 0..<6 {
             let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
             item.isEnabled = false
             item.isHidden = true
@@ -507,17 +1150,43 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        runFastItem = NSMenuItem(title: "Run Fast Pipeline", action: #selector(runFastPipeline), keyEquivalent: "r")
+        runFastItem = NSMenuItem(title: RunPreset.fast.menuTitle, action: #selector(runFastPipeline), keyEquivalent: "r")
         runFastItem.target = self
         menu.addItem(runFastItem)
 
-        runFullItem = NSMenuItem(title: "Run Full Pipeline", action: #selector(runFullPipeline), keyEquivalent: "R")
+        runFullItem = NSMenuItem(title: RunPreset.full.menuTitle, action: #selector(runFullPipeline), keyEquivalent: "R")
         runFullItem.target = self
         menu.addItem(runFullItem)
+
+        runBenchmarkItem = NSMenuItem(title: RunPreset.benchmark.menuTitle, action: #selector(runBenchmarkPipeline), keyEquivalent: "b")
+        runBenchmarkItem.target = self
+        menu.addItem(runBenchmarkItem)
+
+        let openChatItem = NSMenuItem(title: "Open Local Chat", action: #selector(openLocalChat), keyEquivalent: "l")
+        openChatItem.target = self
+        menu.addItem(openChatItem)
 
         let stopItem = NSMenuItem(title: "Stop Running Job", action: #selector(stopJob), keyEquivalent: "s")
         stopItem.target = self
         menu.addItem(stopItem)
+
+        menu.addItem(.separator())
+
+        historySummaryItem = NSMenuItem(title: "Run history: none", action: nil, keyEquivalent: "")
+        historySummaryItem.isEnabled = false
+        menu.addItem(historySummaryItem)
+
+        historyDetailItem = NSMenuItem(title: "Last metrics: n/a", action: nil, keyEquivalent: "")
+        historyDetailItem.isEnabled = false
+        menu.addItem(historyDetailItem)
+
+        historyDeltaItem = NSMenuItem(title: "Comparison: n/a", action: nil, keyEquivalent: "")
+        historyDeltaItem.isEnabled = false
+        menu.addItem(historyDeltaItem)
+
+        let openHistoryItem = NSMenuItem(title: "Open Run History JSON", action: #selector(openRunHistoryFile), keyEquivalent: "j")
+        openHistoryItem.target = self
+        menu.addItem(openHistoryItem)
 
         menu.addItem(.separator())
 
@@ -554,19 +1223,80 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             statusLineItem.title = code == 0 ? "Status: last run succeeded" : "Status: last run failed (\(code))"
         }
         refreshModelIndex(force: true)
+        refreshUpstreamInfo(force: true)
+        refreshRunHistoryLines()
     }
 
     private func setRunning(_ running: Bool, message: String) {
         runFastItem.isEnabled = !running
         runFullItem.isEnabled = !running
+        runBenchmarkItem.isEnabled = !running
         statusLineItem.title = "Status: \(message)"
         updateStatusButton()
     }
 
-    private func runPipeline(qosRuns: Int, skipBuild: Bool) {
-        guard process == nil else { return }
+    private func command(for preset: RunPreset) -> String? {
+        let fileManager = FileManager.default
+        let researchScript = "\(repoRoot)/training/research/run_research.py"
+        if fileManager.fileExists(atPath: researchScript) {
+            switch preset {
+            case .fast:
+                return "uv run python training/research/run_research.py --qos-runs 2 --skip-build"
+            case .full:
+                return "uv run python training/research/run_research.py --qos-runs 3"
+            case .benchmark:
+                return "uv run python training/research/run_research.py --qos-runs 5"
+            }
+        }
 
-        let command = "uv run python training/research/run_research.py --qos-runs \(qosRuns) \(skipBuild ? "--skip-build" : "")"
+        let makefile = "\(repoRoot)/training/Makefile"
+        let hasMakefile = fileManager.fileExists(atPath: makefile)
+        if hasMakefile {
+            let aneTargetPath = "\(repoRoot)/training/train_large_ane.m"
+            let standardTargetPath = "\(repoRoot)/training/train_large.m"
+            let target: String
+            if fileManager.fileExists(atPath: aneTargetPath) {
+                target = "train_large_ane"
+            } else if fileManager.fileExists(atPath: standardTargetPath) {
+                target = "train_large"
+            } else {
+                return nil
+            }
+
+            let steps: Int
+            switch preset {
+            case .fast:
+                steps = 40
+            case .full:
+                steps = 200
+            case .benchmark:
+                steps = 100
+            }
+
+            return "make -C training \(target) && ./training/\(target) --steps \(steps)"
+        }
+
+        return nil
+    }
+
+    private func runPreset(_ preset: RunPreset) {
+        guard process == nil else {
+            return
+        }
+
+        guard let command = command(for: preset) else {
+            statusLineItem.title = "Status: no matching run command for repo"
+            return
+        }
+
+        currentRunPreset = preset
+        currentRunCommand = command
+        currentRunAneUtilization = nil
+        currentRunAneTFLOPS = nil
+        currentRunTotalTFLOPS = nil
+        currentRunAvgTrainMS = nil
+        runStartedAt = Date()
+
         let proc = Process()
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -575,6 +1305,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
+
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else {
@@ -585,16 +1316,18 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             }
         }
 
-        setRunning(true, message: skipBuild ? "running fast pipeline" : "running full pipeline")
+        setRunning(true, message: "running \(preset.displayTitle) preset")
         process = proc
 
         proc.terminationHandler = { [weak self, weak pipe] finished in
             Task { @MainActor in
                 pipe?.fileHandleForReading.readabilityHandler = nil
-                self?.lastExitCode = finished.terminationStatus
                 self?.process = nil
-                let ok = finished.terminationStatus == 0
-                self?.setRunning(false, message: ok ? "idle" : "error")
+                self?.lastExitCode = finished.terminationStatus
+
+                let succeeded = finished.terminationStatus == 0
+                self?.setRunning(false, message: succeeded ? "idle" : "error")
+                self?.persistRunResult(exitCode: finished.terminationStatus)
                 self?.refreshInfoLines()
             }
         }
@@ -603,18 +1336,76 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             try proc.run()
         } catch {
             process = nil
-            setRunning(false, message: "launch failed")
             lastExitCode = 1
+            setRunning(false, message: "launch failed")
+            persistRunResult(exitCode: 1)
             refreshInfoLines()
         }
     }
 
+    private func persistRunResult(exitCode: Int32) {
+        guard let preset = currentRunPreset,
+              let command = currentRunCommand,
+              let startedAt = runStartedAt
+        else {
+            currentRunPreset = nil
+            currentRunCommand = nil
+            runStartedAt = nil
+            return
+        }
+
+        hydrateMetricsFromResearchArtifactsIfNeeded(command: command)
+
+        let endedAt = Date()
+        let duration = endedAt.timeIntervalSince(startedAt)
+
+        let record = RunRecord(
+            id: UUID().uuidString,
+            mode: preset.rawValue,
+            command: command,
+            repoRoot: repoRoot,
+            repoHead: lastSeenRepoSHA,
+            startedAt: startedAt,
+            endedAt: endedAt,
+            durationSeconds: duration,
+            exitCode: exitCode,
+            aneUtilization: currentRunAneUtilization,
+            aneTFLOPS: currentRunAneTFLOPS,
+            totalTFLOPS: currentRunTotalTFLOPS,
+            avgTrainMS: currentRunAvgTrainMS
+        )
+
+        historyStore.append(record)
+        refreshRunHistoryLines()
+
+        currentRunPreset = nil
+        currentRunCommand = nil
+        runStartedAt = nil
+    }
+
     @objc private func runFastPipeline() {
-        runPipeline(qosRuns: 2, skipBuild: true)
+        runPreset(.fast)
     }
 
     @objc private func runFullPipeline() {
-        runPipeline(qosRuns: 3, skipBuild: false)
+        runPreset(.full)
+    }
+
+    @objc private func runBenchmarkPipeline() {
+        runPreset(.benchmark)
+    }
+
+    @objc private func openLocalChat() {
+        if chatWindowController == nil {
+            chatWindowController = ChatWindowController()
+        }
+        let fallbackModels = lastModelCatalog?.artifacts
+            .prefix(8)
+            .map { URL(fileURLWithPath: $0.relativePath).deletingPathExtension().lastPathComponent } ?? []
+        chatWindowController?.setFallbackModels(fallbackModels)
+        chatWindowController?.showWindow(nil)
+        chatWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func stopJob() {
@@ -622,30 +1413,53 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openResultsFolder() {
-        let path = "\(repoRoot)/training/research/results"
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        let candidates = [
+            "\(repoRoot)/training/research/results",
+            "\(repoRoot)/training",
+            repoRoot,
+        ]
+        openFirstExistingPath(candidates)
     }
 
     @objc private func openHeroGraphic() {
-        let path = "\(repoRoot)/training/research/results/figures/ane_hero_card_instagram.png"
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        let candidates = [
+            "\(repoRoot)/training/research/results/figures/ane_hero_card_instagram.png",
+            "\(repoRoot)/training/dashboard.gif",
+            "\(repoRoot)/README.md",
+        ]
+        openFirstExistingPath(candidates)
     }
 
     @objc private func openSpotlightGraphic() {
-        let path = "\(repoRoot)/training/research/results/figures/ecosystem_spotlight_card_instagram.png"
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        let candidates = [
+            "\(repoRoot)/training/research/results/figures/ecosystem_spotlight_card_instagram.png",
+            "\(repoRoot)/training/m5result.md",
+            "\(repoRoot)/README.md",
+        ]
+        openFirstExistingPath(candidates)
     }
 
     @objc private func copyTodayPost() {
-        let path = "\(repoRoot)/training/research/results/content/today_post_premium.md"
-        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
-            statusLineItem.title = "Status: could not read today post"
-            return
+        let candidates = [
+            "\(repoRoot)/training/research/results/content/today_post_premium.md",
+            "\(repoRoot)/training/research/results/content/today_post.md",
+        ]
+
+        for path in candidates {
+            if let text = try? String(contentsOfFile: path, encoding: .utf8) {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(text, forType: .string)
+                statusLineItem.title = "Status: post draft copied"
+                return
+            }
         }
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-        statusLineItem.title = "Status: today post copied"
+
+        statusLineItem.title = "Status: could not find post draft"
+    }
+
+    @objc private func openRunHistoryFile() {
+        NSWorkspace.shared.open(historyStore.fileURL)
     }
 
     @objc private func chooseRepoRoot() {
@@ -660,15 +1474,28 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             repoRoot = url.path
             statusLineItem.title = "Status: repo updated"
             refreshModelIndex(force: true)
+            refreshUpstreamInfo(force: true)
         }
+    }
+
+    @objc private func refreshModelIndexManual() {
+        refreshModelIndex(force: true)
+    }
+
+    @objc private func refreshUpstreamManual() {
+        refreshUpstreamInfo(force: true)
     }
 
     @objc private func quit() {
         NSApp.terminate(nil)
     }
 
-    @objc private func refreshModelIndexManual() {
-        refreshModelIndex(force: true)
+    private func openFirstExistingPath(_ candidates: [String]) {
+        for path in candidates where FileManager.default.fileExists(atPath: path) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+            return
+        }
+        statusLineItem.title = "Status: path not found"
     }
 
     private func startMetricsLoop() {
@@ -678,9 +1505,11 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
                 self?.refreshMetrics()
             }
         }
+
         if let timer = metricsTimer {
             RunLoop.main.add(timer, forMode: .common)
         }
+
         refreshMetrics()
     }
 
@@ -689,22 +1518,29 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         if metricsTick % 20 == 0 {
             refreshModelIndex(force: false)
         }
+        if metricsTick % 30 == 0 {
+            refreshUpstreamInfo(force: false)
+        }
+        if metricsTick % 5 == 0, let command = currentRunCommand {
+            hydrateMetricsFromResearchArtifactsIfNeeded(command: command)
+        }
+
         guard let cpu = metricsSampler.sampleCPU() else {
             return
         }
-        let memory = metricsSampler.sampleMemoryPercent()
-        let load1m = metricsSampler.sampleLoadAverage1m()
+
         let sample = LiveMetricsSample(
             timestamp: Date(),
             totalCPUUsage: cpu.total,
             pCoreUsage: cpu.pCores,
             eCoreUsage: cpu.eCores,
-            memoryUsage: memory,
-            load1m: load1m,
+            memoryUsage: metricsSampler.sampleMemoryPercent(),
+            load1m: metricsSampler.sampleLoadAverage1m(),
             aneUtilization: activeANEUtilization(),
             aneTFLOPS: activeANETflops(),
             runActive: process != nil
         )
+
         latestMetrics = sample
         metricsView.push(sample)
         updateStatusButton()
@@ -714,6 +1550,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else {
             return
         }
+
         guard let latestMetrics else {
             button.title = process == nil ? "ANE" : "ANE*"
             return
@@ -740,13 +1577,24 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     }
 
     private func parseMetricsLine(_ line: String) {
-        if let util = captureDouble(in: line, pattern: #"ANE utilization:\s*([0-9]+(?:\.[0-9]+)?)%"#) {
-            lastANEUtilization = util
+        if let utilization = captureDouble(in: line, pattern: #"ANE utilization:\s*([0-9]+(?:\.[0-9]+)?)%"#) {
+            lastANEUtilization = utilization
+            currentRunAneUtilization = utilization
             lastANEUpdateAt = Date()
         }
-        if let tflops = captureDouble(in: line, pattern: #"ANE TFLOPS:\s*([0-9]+(?:\.[0-9]+)?)"#) {
-            lastANETflops = tflops
+
+        if let aneTFLOPS = captureDouble(in: line, pattern: #"ANE TFLOPS:\s*([0-9]+(?:\.[0-9]+)?)"#) {
+            lastANETflops = aneTFLOPS
+            currentRunAneTFLOPS = aneTFLOPS
             lastANEUpdateAt = Date()
+        }
+
+        if let totalTFLOPS = captureDouble(in: line, pattern: #"Total TFLOPS:\s*([0-9]+(?:\.[0-9]+)?)"#) {
+            currentRunTotalTFLOPS = totalTFLOPS
+        }
+
+        if let avgTrainMS = captureDouble(in: line, pattern: #"Avg train:\s*([0-9]+(?:\.[0-9]+)?)\s*ms/step"#) {
+            currentRunAvgTrainMS = avgTrainMS
         }
     }
 
@@ -754,7 +1602,6 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         guard let timestamp = lastANEUpdateAt else {
             return nil
         }
-        // Treat ANE metrics as stale if they were not refreshed recently.
         if Date().timeIntervalSince(timestamp) > 30 * 60 {
             return nil
         }
@@ -790,41 +1637,175 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         if modelRefreshInFlight {
             return
         }
+
         modelRefreshInFlight = true
         let root = repoRoot
-        Task.detached(priority: .utility) {
-            let models = discoverModelArtifacts(in: root)
-            await MainActor.run { [weak self] in
-                self?.applyTrackedModels(models)
+        DispatchQueue.global(qos: .utility).async {
+            let catalog = discoverModelCatalog(in: root)
+            DispatchQueue.main.async { [weak self] in
+                self?.applyModelCatalog(catalog, force: force)
                 self?.modelRefreshInFlight = false
             }
         }
     }
 
-    private func applyTrackedModels(_ models: [String]) {
-        let previousCount = trackedModels.count
-        trackedModels = models
+    private func applyModelCatalog(_ catalog: ModelCatalog, force: Bool) {
+        let previousPaths = Set(lastModelCatalog?.artifacts.map(\.relativePath) ?? [])
+        let currentPaths = Set(catalog.artifacts.map(\.relativePath))
+        let added = currentPaths.subtracting(previousPaths)
+        let removed = previousPaths.subtracting(currentPaths)
 
-        let shown = min(models.count, modelDetailItems.count)
-        let suffix = models.count > shown ? " (showing \(shown))" : ""
-        modelSummaryItem.title = "Models tracked: \(models.count)\(suffix)"
+        modelSummaryItem.title = "Models: \(catalog.totalCount) files | \(formatBytes(catalog.totalSizeBytes))"
+
+        if lastModelCatalog == nil {
+            modelDeltaItem.title = "Model delta: baseline scan"
+        } else {
+            modelDeltaItem.title = "Model delta: +\(added.count) / -\(removed.count)"
+            if !force, (added.count > 0 || removed.count > 0) {
+                statusLineItem.title = "Status: model catalog changed (+\(added.count) -\(removed.count))"
+            }
+        }
+
+        var lines: [String] = []
+
+        let families = catalog.extensionCounts.prefix(3).map { "\($0.0):\($0.1)" }.joined(separator: ", ")
+        lines.append(families.isEmpty ? "Families: none" : "Families: \(families)")
+
+        if !added.isEmpty {
+            let addedPreview = added.sorted().prefix(2).map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")
+            lines.append("Added: \(addedPreview)")
+        } else {
+            lines.append("Added: none")
+        }
+
+        let newest = catalog.newest(limit: 3)
+        if newest.isEmpty {
+            lines.append("Newest: none")
+        } else {
+            for artifact in newest {
+                lines.append("Newest: \(URL(fileURLWithPath: artifact.relativePath).lastPathComponent)")
+            }
+        }
 
         for index in 0..<modelDetailItems.count {
             let item = modelDetailItems[index]
-            if index < shown {
-                let modelPath = models[index]
-                item.title = "Model \(index + 1): \(URL(fileURLWithPath: modelPath).lastPathComponent)"
-                item.toolTip = modelPath
+            if index < lines.count {
+                item.title = truncate(lines[index], maxLength: 72)
                 item.isHidden = false
             } else {
                 item.title = ""
-                item.toolTip = nil
                 item.isHidden = true
             }
         }
 
-        if previousCount != 0, previousCount != models.count {
-            statusLineItem.title = "Status: model index updated (\(models.count))"
+        lastModelCatalog = catalog
+    }
+
+    private func refreshUpstreamInfo(force: Bool) {
+        if upstreamRefreshInFlight {
+            return
+        }
+
+        upstreamRefreshInFlight = true
+        let root = repoRoot
+        DispatchQueue.global(qos: .utility).async {
+            let head = readGitHeadInfo(in: root)
+            let dirty = readGitDirty(in: root)
+            DispatchQueue.main.async { [weak self] in
+                self?.applyUpstreamInfo(head: head, dirty: dirty, force: force)
+                self?.upstreamRefreshInFlight = false
+            }
+        }
+    }
+
+    private func applyUpstreamInfo(head: GitHeadInfo?, dirty: Bool, force: Bool) {
+        guard let head else {
+            upstreamHeadItem.title = "HEAD: unavailable"
+            upstreamMetaItem.title = "Repo status: not a git repository"
+            return
+        }
+
+        upstreamHeadItem.title = "HEAD: \(head.shortSHA) \(truncate(head.subject, maxLength: 52))"
+
+        let relativeFormatter = RelativeDateTimeFormatter()
+        relativeFormatter.unitsStyle = .short
+        let ageText = relativeFormatter.localizedString(for: head.timestamp, relativeTo: Date())
+        upstreamMetaItem.title = "Repo: \(dirty ? "dirty" : "clean") | \(ageText)"
+
+        if let lastSeenRepoSHA, lastSeenRepoSHA != head.shortSHA, !force {
+            statusLineItem.title = "Status: repo head changed to \(head.shortSHA)"
+        }
+        lastSeenRepoSHA = head.shortSHA
+    }
+
+    private func refreshRunHistoryLines() {
+        let recent = historyStore.recent(limit: 2)
+        guard let latest = recent.last else {
+            historySummaryItem.title = "Run history: none"
+            historyDetailItem.title = "Last metrics: n/a"
+            historyDeltaItem.title = "Comparison: n/a"
+            return
+        }
+
+        let outcome = latest.exitCode == 0 ? "ok" : "failed(\(latest.exitCode))"
+        historySummaryItem.title = "Last run: \(latest.mode) | \(outcome) | \(formatDuration(latest.durationSeconds))"
+
+        var metricParts: [String] = []
+        if let tflops = latest.aneTFLOPS {
+            metricParts.append(String(format: "ANE %.2fT", tflops))
+        }
+        if let util = latest.aneUtilization {
+            metricParts.append(String(format: "Util %.1f%%", util))
+        }
+        if let avgTrainMS = latest.avgTrainMS {
+            metricParts.append(String(format: "Avg %.1fms", avgTrainMS))
+        }
+        historyDetailItem.title = metricParts.isEmpty ? "Last metrics: n/a" : "Last metrics: \(metricParts.joined(separator: " | "))"
+
+        guard recent.count == 2 else {
+            historyDeltaItem.title = "Comparison: waiting for second run"
+            return
+        }
+
+        let previous = recent[0]
+        var deltas: [String] = []
+        if let last = latest.aneTFLOPS, let prev = previous.aneTFLOPS {
+            deltas.append("ANE " + formatSigned(last - prev, suffix: "T"))
+        }
+        if let last = latest.aneUtilization, let prev = previous.aneUtilization {
+            deltas.append("Util " + formatSigned(last - prev, suffix: "%"))
+        }
+        if let last = latest.avgTrainMS, let prev = previous.avgTrainMS {
+            deltas.append("Avg " + formatSigned(last - prev, suffix: "ms"))
+        }
+
+        historyDeltaItem.title = deltas.isEmpty ? "Comparison: n/a" : "Comparison: \(deltas.joined(separator: " | "))"
+    }
+
+    private func hydrateMetricsFromResearchArtifactsIfNeeded(command: String) {
+        guard command.contains("run_research.py"),
+              let summary = parseResearchSummary(in: repoRoot)
+        else {
+            return
+        }
+
+        if currentRunAneTFLOPS == nil {
+            currentRunAneTFLOPS = summary.aneTFLOPS
+        }
+        if currentRunAneUtilization == nil {
+            currentRunAneUtilization = summary.aneUtilization
+        }
+        if currentRunAvgTrainMS == nil {
+            currentRunAvgTrainMS = summary.avgStepMS
+        }
+
+        if let utilization = currentRunAneUtilization {
+            lastANEUtilization = utilization
+            lastANEUpdateAt = Date()
+        }
+        if let tflops = currentRunAneTFLOPS {
+            lastANETflops = tflops
+            lastANEUpdateAt = Date()
         }
     }
 }
