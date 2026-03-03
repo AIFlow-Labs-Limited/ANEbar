@@ -1,5 +1,10 @@
 # SwiftPM build outputs
 apps/ANEBar/.build/
+apps/ANEBar/.artifacts/
+apps/ANEBar/ANEBar.app
 
 # macOS
 .DS_Store
+
+# Private local references (never pushed)
+.private/
