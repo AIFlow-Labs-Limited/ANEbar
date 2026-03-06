@@ -370,6 +370,23 @@ private enum ExperimentGroup: String, CaseIterable {
     case validation = "Validation"
     case bridge = "Bridge"
     case lab = "Lab"
+
+    var sortRank: Int {
+        switch self {
+        case .peak:
+            return 0
+        case .training:
+            return 1
+        case .dynamic:
+            return 2
+        case .validation:
+            return 3
+        case .bridge:
+            return 4
+        case .lab:
+            return 5
+        }
+    }
 }
 
 private struct ExperimentDefinition {
@@ -426,6 +443,24 @@ private struct ExperimentDefinition {
     }
 }
 
+private func missingPrerequisites(for experiment: ExperimentDefinition, repoRoot: String) -> [String] {
+    let fileManager = FileManager.default
+    func has(_ relativePath: String) -> Bool {
+        fileManager.fileExists(atPath: "\(repoRoot)/\(relativePath)")
+    }
+
+    let command = experiment.resolvedCommand(repoRoot: repoRoot) ?? experiment.runCommand ?? ""
+    var missing: [String] = []
+
+    if command.contains("train_large") || command.contains("dashboard.py") {
+        if !has("training/tinystories_data00.bin") {
+            missing.append("training/tinystories_data00.bin")
+        }
+    }
+
+    return missing
+}
+
 private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile) -> [ExperimentDefinition] {
     let fileManager = FileManager.default
     func has(_ relativePath: String) -> Bool {
@@ -446,7 +481,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
     appendIfPresent("inmem_basic.m", experiment: ExperimentDefinition(
         id: "inmem_basic",
         title: "In-memory Basic Probe",
-        summary: "Quick sanity check for the in-memory ANE model path.",
+        summary: "Quick sanity check for the in-memory ANE model path. Current local run fails at runtime on this machine.",
         group: .peak,
         workingDirectory: "{repo}",
         buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework CoreML -framework IOSurface -ldl -o inmem_basic inmem_basic.m",
@@ -458,7 +493,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
     appendIfPresent("inmem_peak.m", experiment: ExperimentDefinition(
         id: "inmem_peak",
         title: "In-memory Peak Throughput",
-        summary: "High-signal peak probe for the strongest public ANE throughput clips.",
+        summary: "High-signal peak probe for the strongest public ANE throughput clips. Verified locally around 7.25-10.91 TFLOPS.",
         group: .peak,
         workingDirectory: "{repo}",
         buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework CoreML -framework IOSurface -ldl -o inmem_peak inmem_peak.m",
@@ -469,7 +504,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
     appendIfPresent("inmem_bench.m", experiment: ExperimentDefinition(
         id: "inmem_bench",
         title: "In-memory Benchmark Sweep",
-        summary: "Broader in-memory benchmark sweep for throughput comparisons.",
+        summary: "Broader in-memory benchmark sweep for throughput comparisons. Current local run returns FAIL(-1) across the sweep.",
         group: .peak,
         workingDirectory: "{repo}",
         buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework IOSurface -ldl -o inmem_bench inmem_bench.m",
@@ -480,7 +515,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
     appendIfPresent("sram_bench.m", experiment: ExperimentDefinition(
         id: "sram_bench",
         title: "SRAM Benchmark",
-        summary: "Benchmarks SRAM-oriented probe behavior on the current ANE family.",
+        summary: "Benchmarks SRAM-oriented probe behavior on the current ANE family. Current local run returns FAIL(-1) across the sweep.",
         group: .peak,
         workingDirectory: "{repo}",
         buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework CoreML -framework IOSurface -ldl -o sram_bench sram_bench.m",
@@ -491,7 +526,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
     appendIfPresent("sram_probe.m", experiment: ExperimentDefinition(
         id: "sram_probe",
         title: "SRAM Probe",
-        summary: "Low-level SRAM probe useful for architecture exploration and failure reports.",
+        summary: "Low-level SRAM probe useful for architecture exploration and failure reports. Current local run returns FAIL(-1) on this machine.",
         group: .peak,
         workingDirectory: "{repo}",
         buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework IOSurface -ldl -o sram_probe sram_probe.m",
@@ -504,7 +539,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
     appendIfPresent("training/train_large.m", experiment: ExperimentDefinition(
         id: "train_large",
         title: "Static Training Baseline",
-        summary: "Mainline baseline training path with JSON step and perf telemetry on stderr.",
+        summary: "Mainline baseline training path with JSON step and perf telemetry on stderr. Requires local TinyStories data before it can run here.",
         group: .training,
         workingDirectory: "{repo}",
         buildCommand: "make -C training train_large",
@@ -515,7 +550,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
     appendIfPresent("training/train_large_ane.m", experiment: ExperimentDefinition(
         id: "train_large_ane",
         title: "Static Training + ANE Extras",
-        summary: "Mainline training path with ANE-offloaded extras and final throughput summaries.",
+        summary: "Mainline training path with ANE-offloaded extras and final throughput summaries. Requires local TinyStories data before it can run here.",
         group: .training,
         workingDirectory: "{repo}",
         buildCommand: "make -C training train_large_ane",
@@ -526,7 +561,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
     appendIfPresent("training/dashboard.py", experiment: ExperimentDefinition(
         id: "dashboard_ane",
         title: "Dashboard ANE Mode",
-        summary: "Live terminal dashboard for the static path with optional powermetrics integration.",
+        summary: "Live terminal dashboard for the static path with optional powermetrics integration. Depends on the train_large prerequisites.",
         group: .training,
         workingDirectory: "{repo}/training",
         buildCommand: nil,
@@ -644,12 +679,12 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
             ExperimentDefinition(
                 id: "lab_research",
                 title: "Lab Research Pipeline",
-                summary: "Runs the private research stack that generates charts, reports, and social assets.",
+                summary: "Runs the private research stack that generates charts, reports, and social assets. This is a report pipeline, not a live ANE telemetry run.",
                 group: .lab,
                 workingDirectory: "{repo}",
                 buildCommand: "uv sync",
                 runCommand: "uv run python training/research/run_research.py --qos-runs 3",
-                telemetry: "artifact hydration + stdout summary",
+                telemetry: "artifact report from probe logs",
                 sourcePath: "training/research/run_research.py"
             )
         )
@@ -662,7 +697,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
             }
             return lhs.advanced == false && rhs.advanced == true
         }
-        return lhs.group.rawValue < rhs.group.rawValue
+        return lhs.group.sortRank < rhs.group.sortRank
     }
 }
 
@@ -1208,6 +1243,77 @@ private func parseResearchSummary(in repoRoot: String) -> ResearchSummarySnapsho
     )
 }
 
+private func configuredPeakTFLOPS() -> Double {
+    Double(ProcessInfo.processInfo.environment["ANE_PEAK_TFLOPS"] ?? "") ?? 15.8
+}
+
+private func parseBestTFLOPSFromTable(_ text: String) -> Double? {
+    var best: Double?
+    for rawLine in text.split(whereSeparator: \.isNewline).map(String.init) {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, !line.contains("FAIL(") else {
+            continue
+        }
+        let matches = line.matches(of: /([0-9]+(?:\.[0-9]+)?)\s*(?:%|ms)?/)
+        let numbers = matches.compactMap { Double($0.1) }
+        guard numbers.count >= 2 else {
+            continue
+        }
+        let candidate = numbers[numbers.count - 2]
+        if candidate > 0, (best == nil || candidate > (best ?? 0)) {
+            best = candidate
+        }
+    }
+    return best
+}
+
+private func parseQosSweepSummary(_ text: String) -> ResearchSummarySnapshot? {
+    guard let kernelMatch = text.firstMatch(of: /Kernel:\s+.*\(([0-9]+(?:\.[0-9]+)?)\s+MFLOPS\)/),
+          let kernelMFLOPS = Double(kernelMatch.1)
+    else {
+        return nil
+    }
+
+    var bestEvalMS: Double?
+    for rawLine in text.split(whereSeparator: \.isNewline).map(String.init) {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard line.hasSuffix("OK") else {
+            continue
+        }
+        let matches = line.matches(of: /([0-9]+(?:\.[0-9]+)?)ms/)
+        let values = matches.compactMap { Double($0.1) }
+        guard values.count >= 4 else {
+            continue
+        }
+        let evalAverage = values[3]
+        if bestEvalMS == nil || evalAverage < (bestEvalMS ?? .greatestFiniteMagnitude) {
+            bestEvalMS = evalAverage
+        }
+    }
+
+    guard let bestEvalMS else {
+        return nil
+    }
+    let throughputGFLOPS = kernelMFLOPS / bestEvalMS
+    let aneTFLOPS = throughputGFLOPS / 1000.0
+    let peak = configuredPeakTFLOPS()
+    let utilization = peak > 0 ? (aneTFLOPS / peak) * 100.0 : nil
+    return ResearchSummarySnapshot(
+        aneTFLOPS: aneTFLOPS,
+        aneUtilization: utilization,
+        avgStepMS: bestEvalMS
+    )
+}
+
+private func isLiveTelemetrySource(_ source: String?) -> Bool {
+    switch source {
+    case "live JSON stream", "dashboard live stream", "powermetrics live":
+        return true
+    default:
+        return false
+    }
+}
+
 @MainActor
 private final class ExperimentActionButton: NSButton {
     var experimentID: String = ""
@@ -1284,6 +1390,7 @@ private final class ExperimentConsoleWindowController: NSWindowController {
 
     private var allExperiments: [ExperimentDefinition] = []
     private var experimentsByID: [String: ExperimentDefinition] = [:]
+    private var repoRoot: String = ""
     private var runButtons: [ExperimentActionButton] = []
     private var queueButtons: [ExperimentActionButton] = []
     private var isBusy: Bool = false
@@ -1310,7 +1417,8 @@ private final class ExperimentConsoleWindowController: NSWindowController {
         return nil
     }
 
-    func update(profile: RepoProfile, experiments: [ExperimentDefinition]) {
+    func update(profile: RepoProfile, repoRoot: String, experiments: [ExperimentDefinition]) {
+        self.repoRoot = repoRoot
         allExperiments = experiments
         experimentsByID = Dictionary(uniqueKeysWithValues: experiments.map { ($0.id, $0) })
         let runnableCount = experiments.filter(\.isRunnable).count
@@ -1322,11 +1430,21 @@ private final class ExperimentConsoleWindowController: NSWindowController {
     func setBusy(_ busy: Bool) {
         isBusy = busy
         for button in runButtons {
-            let runnable = experimentsByID[button.experimentID]?.isRunnable == true
+            let runnable: Bool
+            if let experiment = experimentsByID[button.experimentID] {
+                runnable = experiment.isRunnable && missingPrerequisites(for: experiment, repoRoot: repoRoot).isEmpty
+            } else {
+                runnable = false
+            }
             button.isEnabled = !busy && runnable
         }
         for button in queueButtons {
-            let runnable = experimentsByID[button.experimentID]?.isRunnable == true
+            let runnable: Bool
+            if let experiment = experimentsByID[button.experimentID] {
+                runnable = experiment.isRunnable && missingPrerequisites(for: experiment, repoRoot: repoRoot).isEmpty
+            } else {
+                runnable = false
+            }
             button.isEnabled = !busy && runnable
         }
     }
@@ -1434,6 +1552,7 @@ private final class ExperimentConsoleWindowController: NSWindowController {
     }
 
     private func makeCard(for experiment: ExperimentDefinition) -> NSView {
+        let missing = missingPrerequisites(for: experiment, repoRoot: repoRoot)
         let card = NSView()
         card.wantsLayer = true
         card.layer?.cornerRadius = 12
@@ -1448,13 +1567,15 @@ private final class ExperimentConsoleWindowController: NSWindowController {
         summaryLabel.font = .systemFont(ofSize: 12)
         summaryLabel.textColor = .secondaryLabelColor
 
-        let metaLabel = NSTextField(labelWithString: experiment.metadataLine)
+        let metaParts = [experiment.metadataLine] + (missing.isEmpty ? [] : ["missing: " + missing.joined(separator: ", ")])
+        let metaLabel = NSTextField(labelWithString: metaParts.joined(separator: " | "))
         metaLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         metaLabel.textColor = .tertiaryLabelColor
 
-        let runButton = ExperimentActionButton(title: experiment.isRunnable ? "Run" : "Catalogued", target: self, action: #selector(runPressed(_:)))
+        let runTitle = !experiment.isRunnable ? "Catalogued" : (missing.isEmpty ? "Run" : "Blocked")
+        let runButton = ExperimentActionButton(title: runTitle, target: self, action: #selector(runPressed(_:)))
         runButton.experimentID = experiment.id
-        runButton.isEnabled = experiment.isRunnable
+        runButton.isEnabled = experiment.isRunnable && missing.isEmpty
         runButtons.append(runButton)
 
         let copyButton = ExperimentActionButton(title: experiment.isRunnable ? "Copy Command" : "Copy Source Path", target: self, action: #selector(copyPressed(_:)))
@@ -1462,7 +1583,7 @@ private final class ExperimentConsoleWindowController: NSWindowController {
 
         let queueButton = ExperimentActionButton(title: "Queue", target: self, action: #selector(queuePressed(_:)))
         queueButton.experimentID = experiment.id
-        queueButton.isEnabled = experiment.isRunnable
+        queueButton.isEnabled = experiment.isRunnable && missing.isEmpty
         queueButtons.append(queueButton)
 
         let buttonStack = NSStackView(views: [runButton, queueButton, copyButton])
@@ -2477,7 +2598,7 @@ private final class LiveMetricsMenuView: NSView {
 
         let aneValue = latest.aneUtilization
         drawProgressRow(
-            label: "ANE(run)",
+            label: "ANE(live)",
             valueText: aneValue.map(percentText) ?? "n/a",
             value: aneValue ?? 0,
             color: .systemGreen,
@@ -2721,6 +2842,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private var currentRunTitle: String?
     private var currentRunCommand: String?
     private var currentRunWorkingDirectory: String?
+    private var currentRunOutputLog: String = ""
     private var currentRunAneUtilization: Double?
     private var currentRunAneTFLOPS: Double?
     private var currentRunTotalTFLOPS: Double?
@@ -3120,7 +3242,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         let advancedCount = experimentCatalog.filter(\.advanced).count
         profileLineItem.title = "Profile: \(repoProfile.label) | \(runnableCount) runnable | \(advancedCount) advanced"
         profileLineItem.toolTip = repoProfile.detail
-        experimentsWindowController?.update(profile: repoProfile, experiments: experimentCatalog)
+        experimentsWindowController?.update(profile: repoProfile, repoRoot: repoRoot, experiments: experimentCatalog)
         experimentsWindowController?.setBusy(process != nil)
         telemetryWindowController?.updateContext(
             repoProfile: repoProfile,
@@ -3249,11 +3371,15 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         currentRunTitle = title
         currentRunCommand = command
         currentRunWorkingDirectory = workingDirectory
+        currentRunOutputLog = ""
         currentRunAneUtilization = nil
         currentRunAneTFLOPS = nil
         currentRunTotalTFLOPS = nil
         currentRunAvgTrainMS = nil
         currentRunTelemetrySource = "awaiting output"
+        lastANEUtilization = nil
+        lastANETflops = nil
+        lastANEUpdateAt = nil
         refreshTelemetryLine()
         processOutputBuffer = ""
         runStartedAt = Date()
@@ -3338,6 +3464,11 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             statusLineItem.title = "Status: \(experiment.title) is catalogued only"
             return
         }
+        let missing = missingPrerequisites(for: experiment, repoRoot: repoRoot)
+        if !missing.isEmpty {
+            statusLineItem.title = "Status: missing " + missing.joined(separator: ", ")
+            return
+        }
         if let reason = guardrailBlockReason(for: experiment) {
             statusLineItem.title = "Status: blocked by guardrail (\(reason))"
             refreshGuardrailLine()
@@ -3356,6 +3487,11 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private func queueExperiment(_ experiment: ExperimentDefinition, delaySeconds: TimeInterval = 0) {
         guard experiment.isRunnable else {
             statusLineItem.title = "Status: \(experiment.title) is catalogued only"
+            return
+        }
+        let missing = missingPrerequisites(for: experiment, repoRoot: repoRoot)
+        if !missing.isEmpty {
+            statusLineItem.title = "Status: missing " + missing.joined(separator: ", ")
             return
         }
         _ = queueStore.enqueue(experiment: experiment, delaySeconds: delaySeconds)
@@ -3382,12 +3518,14 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             currentRunTitle = nil
             currentRunCommand = nil
             currentRunWorkingDirectory = nil
+            currentRunOutputLog = ""
             currentRunTelemetrySource = nil
             runStartedAt = nil
             return
         }
 
         hydrateMetricsFromResearchArtifactsIfNeeded(command: command)
+        applyCapturedOutputMetricsIfNeeded(experimentID: currentRunExperimentID, output: currentRunOutputLog)
 
         let endedAt = Date()
         let duration = endedAt.timeIntervalSince(startedAt)
@@ -3426,6 +3564,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         currentRunTitle = nil
         currentRunCommand = nil
         currentRunWorkingDirectory = nil
+        currentRunOutputLog = ""
         currentRunTelemetrySource = nil
         runStartedAt = nil
         activeQueueItemID = nil
@@ -3765,6 +3904,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             return
         }
 
+        let liveTelemetry = isLiveTelemetrySource(currentRunTelemetrySource ?? lastTelemetrySource)
         let sample = LiveMetricsSample(
             timestamp: Date(),
             totalCPUUsage: cpu.total,
@@ -3772,8 +3912,8 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             eCoreUsage: cpu.eCores,
             memoryUsage: metricsSampler.sampleMemoryPercent(),
             load1m: metricsSampler.sampleLoadAverage1m(),
-            aneUtilization: activeANEUtilization(),
-            aneTFLOPS: activeANETflops(),
+            aneUtilization: liveTelemetry ? activeANEUtilization() : nil,
+            aneTFLOPS: liveTelemetry ? activeANETflops() : nil,
             telemetrySource: currentRunTelemetrySource ?? lastTelemetrySource ?? "idle",
             runActive: process != nil
         )
@@ -3821,6 +3961,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     }
 
     private func consumeProcessOutput(_ chunk: String) {
+        currentRunOutputLog.append(chunk)
         processOutputBuffer.append(chunk)
         while let newline = processOutputBuffer.range(of: "\n") {
             let line = String(processOutputBuffer[..<newline.lowerBound])
@@ -4279,16 +4420,40 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         if currentRunAvgTrainMS == nil {
             currentRunAvgTrainMS = summary.avgStepMS
         }
+        setTelemetrySource("artifact report")
+    }
 
-        if let utilization = currentRunAneUtilization {
-            lastANEUtilization = utilization
-            lastANEUpdateAt = Date()
+    private func applyCapturedOutputMetricsIfNeeded(experimentID: String?, output: String) {
+        guard let experimentID else {
+            return
         }
-        if let tflops = currentRunAneTFLOPS {
-            lastANETflops = tflops
-            lastANEUpdateAt = Date()
+
+        switch experimentID {
+        case "inmem_peak", "inmem_bench", "sram_bench", "sram_probe":
+            guard currentRunAneTFLOPS == nil, let bestTFLOPS = parseBestTFLOPSFromTable(output) else {
+                return
+            }
+            currentRunAneTFLOPS = bestTFLOPS
+            let peak = configuredPeakTFLOPS()
+            currentRunAneUtilization = peak > 0 ? (bestTFLOPS / peak) * 100.0 : nil
+            setTelemetrySource("benchmark summary")
+        case "test_qos_sweep":
+            guard let summary = parseQosSweepSummary(output) else {
+                return
+            }
+            if currentRunAneTFLOPS == nil {
+                currentRunAneTFLOPS = summary.aneTFLOPS
+            }
+            if currentRunAneUtilization == nil {
+                currentRunAneUtilization = summary.aneUtilization
+            }
+            if currentRunAvgTrainMS == nil {
+                currentRunAvgTrainMS = summary.avgStepMS
+            }
+            setTelemetrySource("probe summary")
+        default:
+            break
         }
-        setTelemetrySource("artifact summary")
     }
 }
 
