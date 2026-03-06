@@ -1683,6 +1683,8 @@ private func benchmarkOverviewText(_ snapshots: [VerifiedBenchmarkSnapshot]) -> 
 @MainActor
 private final class ExperimentActionButton: NSButton {
     var experimentID: String = ""
+    var idleTitleOverride: String?
+    var busyTitleOverride: String?
 }
 
 @MainActor
@@ -1760,6 +1762,7 @@ private final class TelemetryWindowController: NSWindowController {
 private final class ExperimentConsoleWindowController: NSWindowController {
     private let summaryLabel = NSTextField(labelWithString: "ANE experiments")
     private let detailLabel = NSTextField(labelWithString: "")
+    private let activityLabel = NSTextField(labelWithString: "Idle")
     private let scrollView = NSScrollView()
     private let contentStack = NSStackView()
     private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
@@ -1772,6 +1775,7 @@ private final class ExperimentConsoleWindowController: NSWindowController {
     private var runButtons: [ExperimentActionButton] = []
     private var queueButtons: [ExperimentActionButton] = []
     private var isBusy: Bool = false
+    private var currentRunTitle: String?
 
     var onRunExperiment: ((ExperimentDefinition) -> Void)?
     var onQueueExperiment: ((ExperimentDefinition) -> Void)?
@@ -1814,7 +1818,8 @@ private final class ExperimentConsoleWindowController: NSWindowController {
             } else {
                 runnable = false
             }
-            button.isEnabled = !busy && runnable
+            button.isEnabled = runnable
+            button.title = busy ? (button.busyTitleOverride ?? button.title) : (button.idleTitleOverride ?? button.title)
         }
         for button in queueButtons {
             let runnable: Bool
@@ -1823,8 +1828,14 @@ private final class ExperimentConsoleWindowController: NSWindowController {
             } else {
                 runnable = false
             }
-            button.isEnabled = !busy && runnable
+            button.isEnabled = runnable
         }
+        updateActivityLabel()
+    }
+
+    func updateActivity(currentRunTitle: String?) {
+        self.currentRunTitle = currentRunTitle
+        updateActivityLabel()
     }
 
     private func setupUI() {
@@ -1837,6 +1848,8 @@ private final class ExperimentConsoleWindowController: NSWindowController {
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.lineBreakMode = .byWordWrapping
         detailLabel.maximumNumberOfLines = 2
+        activityLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
+        activityLabel.textColor = .secondaryLabelColor
 
         searchField.placeholderString = "Search experiments"
         searchField.target = self
@@ -1882,7 +1895,7 @@ private final class ExperimentConsoleWindowController: NSWindowController {
             contentStack.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
         ])
 
-        let root = NSStackView(views: [headerStack, detailLabel, filterStack, scrollView])
+        let root = NSStackView(views: [headerStack, detailLabel, activityLabel, filterStack, scrollView])
         root.orientation = .vertical
         root.spacing = 10
         root.translatesAutoresizingMaskIntoConstraints = false
@@ -1929,6 +1942,14 @@ private final class ExperimentConsoleWindowController: NSWindowController {
         setBusy(isBusy)
     }
 
+    private func updateActivityLabel() {
+        if isBusy {
+            activityLabel.stringValue = "Running: \(currentRunTitle ?? "job active") | Run Next will queue behind the current job"
+        } else {
+            activityLabel.stringValue = "Idle | Run starts immediately"
+        }
+    }
+
     private func makeCard(for experiment: ExperimentDefinition) -> NSView {
         let missing = missingPrerequisites(for: experiment, repoRoot: repoRoot)
         let card = NSView()
@@ -1953,6 +1974,8 @@ private final class ExperimentConsoleWindowController: NSWindowController {
         let runTitle = !experiment.isRunnable ? "Catalogued" : (missing.isEmpty ? "Run" : "Blocked")
         let runButton = ExperimentActionButton(title: runTitle, target: self, action: #selector(runPressed(_:)))
         runButton.experimentID = experiment.id
+        runButton.idleTitleOverride = runTitle
+        runButton.busyTitleOverride = experiment.isRunnable && missing.isEmpty ? "Run Next" : runTitle
         runButton.isEnabled = experiment.isRunnable && missing.isEmpty
         runButtons.append(runButton)
 
@@ -4044,6 +4067,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         queueFullItem.isEnabled = !running
         queueBenchmarkItem.isEnabled = !running
         experimentsWindowController?.setBusy(running)
+        experimentsWindowController?.updateActivity(currentRunTitle: running ? currentRunTitle : nil)
         historyWindowController?.setBusy(running)
         benchmarksWindowController?.setBusy(running)
         statusLineItem.title = "Status: \(message)"
@@ -4065,6 +4089,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         profileLineItem.toolTip = repoProfile.detail
         experimentsWindowController?.update(profile: repoProfile, repoRoot: repoRoot, experiments: experimentCatalog)
         experimentsWindowController?.setBusy(process != nil)
+        experimentsWindowController?.updateActivity(currentRunTitle: process != nil ? currentRunTitle : nil)
         telemetryWindowController?.updateContext(
             repoProfile: repoProfile,
             repoRoot: repoRoot,
@@ -4202,6 +4227,9 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         queueItemID: String? = nil
     ) {
         guard process == nil else {
+            let active = currentRunTitle ?? "another job"
+            statusLineItem.title = "Status: already running \(active)"
+            experimentsWindowController?.updateActivity(currentRunTitle: active)
             return
         }
         currentRunExperimentID = experimentID
@@ -4310,6 +4338,14 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         if let reason = guardrailBlockReason(for: experiment) {
             statusLineItem.title = "Status: blocked by guardrail (\(reason))"
             refreshGuardrailLine()
+            return
+        }
+        if process != nil, queueItemID == nil {
+            _ = queueStore.enqueue(experiment: experiment)
+            refreshQueueSummary()
+            let active = currentRunTitle ?? "current job"
+            statusLineItem.title = "Status: queued \(experiment.title) behind \(active)"
+            experimentsWindowController?.updateActivity(currentRunTitle: active)
             return
         }
         runResolvedCommand(
