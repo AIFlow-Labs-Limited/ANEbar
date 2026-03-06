@@ -11,6 +11,7 @@ private struct LiveMetricsSample {
     var load1m: Double
     var aneUtilization: Double?
     var aneTFLOPS: Double?
+    var aneLabel: String
     var telemetrySource: String
     var runActive: Bool
 }
@@ -505,45 +506,45 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
     appendIfPresent("inmem_peak.m", experiment: ExperimentDefinition(
         id: "inmem_peak",
         title: "In-memory Peak Throughput",
-        summary: "High-signal peak probe for the strongest public ANE throughput clips. Verified locally around 7.25-10.91 TFLOPS.",
+        summary: "High-signal peak probe for the strongest public ANE throughput clips. Runs as a repeated summary stream inside ANEBar.",
         group: .peak,
         workingDirectory: "{repo}",
-        buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework CoreML -framework IOSurface -ldl -o inmem_peak inmem_peak.m",
-        runCommand: "./inmem_peak",
-        telemetry: "stdout summary",
+        buildCommand: nil,
+        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} inmem_peak 12",
+        telemetry: "summary stream",
         sourcePath: "inmem_peak.m"
     ))
     appendIfPresent("inmem_bench.m", experiment: ExperimentDefinition(
         id: "inmem_bench",
         title: "In-memory Benchmark Sweep",
-        summary: "Broader in-memory benchmark sweep for throughput comparisons. Current local run returns FAIL(-1) across the sweep.",
+        summary: "Broader in-memory benchmark sweep for throughput comparisons. Runs as a repeated summary stream inside ANEBar.",
         group: .peak,
         workingDirectory: "{repo}",
-        buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework IOSurface -ldl -o inmem_bench inmem_bench.m",
-        runCommand: "./inmem_bench",
-        telemetry: "stdout summary",
+        buildCommand: nil,
+        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} inmem_bench 8",
+        telemetry: "summary stream",
         sourcePath: "inmem_bench.m"
     ))
     appendIfPresent("sram_bench.m", experiment: ExperimentDefinition(
         id: "sram_bench",
         title: "SRAM Benchmark",
-        summary: "Benchmarks SRAM-oriented probe behavior on the current ANE family. Current local run returns FAIL(-1) across the sweep.",
+        summary: "Benchmarks SRAM-oriented probe behavior on the current ANE family. Runs as a repeated summary stream inside ANEBar.",
         group: .peak,
         workingDirectory: "{repo}",
-        buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework CoreML -framework IOSurface -ldl -o sram_bench sram_bench.m",
-        runCommand: "./sram_bench",
-        telemetry: "stdout summary",
+        buildCommand: nil,
+        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} sram_bench 8",
+        telemetry: "summary stream",
         sourcePath: "sram_bench.m"
     ))
     appendIfPresent("sram_probe.m", experiment: ExperimentDefinition(
         id: "sram_probe",
         title: "SRAM Probe",
-        summary: "Low-level SRAM probe useful for architecture exploration and failure reports. Current local run returns FAIL(-1) on this machine.",
+        summary: "Low-level SRAM probe useful for architecture exploration and failure reports. Runs as a repeated summary stream inside ANEBar.",
         group: .peak,
         workingDirectory: "{repo}",
-        buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework IOSurface -ldl -o sram_probe sram_probe.m",
-        runCommand: "./sram_probe",
-        telemetry: "stdout summary",
+        buildCommand: nil,
+        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} sram_probe 8",
+        telemetry: "summary stream",
         sourcePath: "sram_probe.m",
         advanced: true
     ))
@@ -637,9 +638,11 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
                 summary: summary,
                 group: .validation,
                 workingDirectory: "{repo}",
-                buildCommand: "make -C training \(id)",
-                runCommand: "./training/\(id)",
-                telemetry: id == "test_qos_sweep" ? "stdout table" : "stdout summary",
+                buildCommand: id == "test_qos_sweep" ? nil : "make -C training \(id)",
+                runCommand: id == "test_qos_sweep"
+                    ? "bash {anebar}/scripts/run_live_probe.sh {repo} test_qos_sweep 12"
+                    : "./training/\(id)",
+                telemetry: id == "test_qos_sweep" ? "summary stream" : "stdout summary",
                 sourcePath: "training/\(id).m",
                 advanced: id == "test_ane_advanced"
             )
@@ -1338,6 +1341,15 @@ private func parseQosSweepSummary(_ text: String) -> ResearchSummarySnapshot? {
 private func isLiveTelemetrySource(_ source: String?) -> Bool {
     switch source {
     case "live JSON stream", "dashboard live stream", "powermetrics live":
+        return true
+    default:
+        return false
+    }
+}
+
+private func isRunDisplayTelemetrySource(_ source: String?) -> Bool {
+    switch source {
+    case "stdout summary", "benchmark summary", "probe summary", "summary stream":
         return true
     default:
         return false
@@ -3422,7 +3434,7 @@ private final class LiveMetricsMenuView: NSView {
 
         let aneValue = latest.aneUtilization
         drawProgressRow(
-            label: "ANE(live)",
+            label: latest.aneLabel,
             valueText: aneValue.map(percentText) ?? "n/a",
             value: aneValue ?? 0,
             color: .systemGreen,
@@ -4818,7 +4830,16 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             return
         }
 
-        let liveTelemetry = isLiveTelemetrySource(currentRunTelemetrySource ?? lastTelemetrySource)
+        let telemetrySource = currentRunTelemetrySource ?? lastTelemetrySource ?? "idle"
+        let liveTelemetry = isLiveTelemetrySource(telemetrySource)
+        let runDisplayTelemetry = process != nil && isRunDisplayTelemetrySource(telemetrySource)
+        let aneLabel = liveTelemetry ? "ANE(live)" : (runDisplayTelemetry ? "ANE(run)" : "ANE(live)")
+        let displayedANEUtilization = liveTelemetry
+            ? activeANEUtilization(maxAge: 30 * 60)
+            : (runDisplayTelemetry ? activeANEUtilization(maxAge: 8) : nil)
+        let displayedANETflops = liveTelemetry
+            ? activeANETflops(maxAge: 30 * 60)
+            : (runDisplayTelemetry ? activeANETflops(maxAge: 8) : nil)
         let sample = LiveMetricsSample(
             timestamp: Date(),
             totalCPUUsage: cpu.total,
@@ -4826,9 +4847,10 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             eCoreUsage: cpu.eCores,
             memoryUsage: metricsSampler.sampleMemoryPercent(),
             load1m: metricsSampler.sampleLoadAverage1m(),
-            aneUtilization: liveTelemetry ? activeANEUtilization() : nil,
-            aneTFLOPS: liveTelemetry ? activeANETflops() : nil,
-            telemetrySource: currentRunTelemetrySource ?? lastTelemetrySource ?? "idle",
+            aneUtilization: displayedANEUtilization,
+            aneTFLOPS: displayedANETflops,
+            aneLabel: aneLabel,
+            telemetrySource: telemetrySource,
             runActive: process != nil
         )
 
@@ -4942,21 +4964,21 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func activeANEUtilization() -> Double? {
+    private func activeANEUtilization(maxAge: TimeInterval = 30 * 60) -> Double? {
         guard let timestamp = lastANEUpdateAt else {
             return nil
         }
-        if Date().timeIntervalSince(timestamp) > 30 * 60 {
+        if Date().timeIntervalSince(timestamp) > maxAge {
             return nil
         }
         return lastANEUtilization
     }
 
-    private func activeANETflops() -> Double? {
+    private func activeANETflops(maxAge: TimeInterval = 30 * 60) -> Double? {
         guard let timestamp = lastANEUpdateAt else {
             return nil
         }
-        if Date().timeIntervalSince(timestamp) > 30 * 60 {
+        if Date().timeIntervalSince(timestamp) > maxAge {
             return nil
         }
         return lastANETflops
