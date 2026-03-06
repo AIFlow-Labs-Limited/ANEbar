@@ -1314,9 +1314,305 @@ private func isLiveTelemetrySource(_ source: String?) -> Bool {
     }
 }
 
+private enum BenchmarkState {
+    case verified
+    case history
+    case warning
+    case failure
+    case blocked
+
+    var label: String {
+        switch self {
+        case .verified:
+            return "Verified"
+        case .history:
+            return "History"
+        case .warning:
+            return "Warning"
+        case .failure:
+            return "Failure"
+        case .blocked:
+            return "Blocked"
+        }
+    }
+
+    var fillColor: NSColor {
+        switch self {
+        case .verified:
+            return NSColor.systemGreen.withAlphaComponent(0.18)
+        case .history:
+            return NSColor.systemBlue.withAlphaComponent(0.18)
+        case .warning:
+            return NSColor.systemOrange.withAlphaComponent(0.18)
+        case .failure:
+            return NSColor.systemRed.withAlphaComponent(0.18)
+        case .blocked:
+            return NSColor.tertiaryLabelColor.withAlphaComponent(0.16)
+        }
+    }
+
+    var strokeColor: NSColor {
+        switch self {
+        case .verified:
+            return NSColor.systemGreen.withAlphaComponent(0.28)
+        case .history:
+            return NSColor.systemBlue.withAlphaComponent(0.28)
+        case .warning:
+            return NSColor.systemOrange.withAlphaComponent(0.28)
+        case .failure:
+            return NSColor.systemRed.withAlphaComponent(0.28)
+        case .blocked:
+            return NSColor.separatorColor.withAlphaComponent(0.2)
+        }
+    }
+}
+
+private struct VerifiedBenchmarkSnapshot {
+    var id: String
+    var title: String
+    var state: BenchmarkState
+    var sortRank: Int
+    var bestTFLOPS: Double?
+    var utilization: Double?
+    var avgStepMS: Double?
+    var evidenceSources: [String]
+    var notes: [String]
+    var logPath: String?
+    var experimentID: String?
+    var canRun: Bool
+    var blockedReason: String?
+    var historyRunCount: Int
+    var telemetryLabel: String?
+}
+
+private func aneBarWorkspaceRoot() -> String? {
+    let sourceURL = URL(fileURLWithPath: #filePath)
+    return sourceURL
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .path
+}
+
+private func latestPrivateSweepDirectory() -> URL? {
+    guard let workspaceRoot = aneBarWorkspaceRoot() else {
+        return nil
+    }
+    let researchRoot = URL(fileURLWithPath: workspaceRoot, isDirectory: true)
+        .appendingPathComponent(".private/research", isDirectory: true)
+    let fileManager = FileManager.default
+    guard let entries = try? fileManager.contentsOfDirectory(
+        at: researchRoot,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return nil
+    }
+
+    let datedDirectories = entries
+        .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+        .sorted { $0.lastPathComponent > $1.lastPathComponent }
+
+    for entry in datedDirectories {
+        let candidate = entry.appendingPathComponent("verification/local_sweep", isDirectory: true)
+        if fileManager.fileExists(atPath: candidate.path) {
+            return candidate
+        }
+    }
+    return nil
+}
+
+private func mergeUnique(_ values: [String]) -> [String] {
+    var seen: Set<String> = []
+    var merged: [String] = []
+    for value in values {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !seen.contains(trimmed) else {
+            continue
+        }
+        seen.insert(trimmed)
+        merged.append(trimmed)
+    }
+    return merged
+}
+
+private func buildVerifiedBenchmarks(
+    repoRoot: String,
+    experiments: [ExperimentDefinition],
+    history: [RunRecord]
+) -> [VerifiedBenchmarkSnapshot] {
+    let experimentsByID = Dictionary(uniqueKeysWithValues: experiments.map { ($0.id, $0) })
+    var snapshots: [String: VerifiedBenchmarkSnapshot] = [:]
+    let peakBudget = configuredPeakTFLOPS()
+
+    func baseSnapshot(
+        id: String,
+        fallbackTitle: String,
+        defaultState: BenchmarkState
+    ) -> VerifiedBenchmarkSnapshot {
+        let experiment = experimentsByID[id]
+        let missing = experiment.map { missingPrerequisites(for: $0, repoRoot: repoRoot) } ?? []
+        let blockedReason = missing.isEmpty ? nil : missing.joined(separator: ", ")
+        let state = blockedReason == nil ? defaultState : .blocked
+        return VerifiedBenchmarkSnapshot(
+            id: id,
+            title: experiment?.title ?? fallbackTitle,
+            state: state,
+            sortRank: experiment?.group.sortRank ?? 99,
+            bestTFLOPS: nil,
+            utilization: nil,
+            avgStepMS: nil,
+            evidenceSources: [],
+            notes: [],
+            logPath: nil,
+            experimentID: experiment?.id,
+            canRun: experiment?.isRunnable == true && blockedReason == nil,
+            blockedReason: blockedReason,
+            historyRunCount: 0,
+            telemetryLabel: nil
+        )
+    }
+
+    func upsert(
+        id: String,
+        fallbackTitle: String,
+        defaultState: BenchmarkState,
+        mutate: (inout VerifiedBenchmarkSnapshot) -> Void
+    ) {
+        var snapshot = snapshots[id] ?? baseSnapshot(id: id, fallbackTitle: fallbackTitle, defaultState: defaultState)
+        mutate(&snapshot)
+        snapshot.evidenceSources = mergeUnique(snapshot.evidenceSources)
+        snapshot.notes = mergeUnique(snapshot.notes)
+        snapshots[id] = snapshot
+    }
+
+    if let sweepDirectory = latestPrivateSweepDirectory() {
+        let rawDirectory = sweepDirectory.appendingPathComponent("raw", isDirectory: true)
+        func rawText(_ name: String) -> String? {
+            let url = rawDirectory.appendingPathComponent(name)
+            return try? String(contentsOf: url, encoding: .utf8)
+        }
+
+        if let text = rawText("inmem_peak_run.log"), let bestTFLOPS = parseBestTFLOPSFromTable(text) {
+            upsert(id: "inmem_peak", fallbackTitle: "In-memory Peak Throughput", defaultState: .verified) { snapshot in
+                snapshot.bestTFLOPS = max(snapshot.bestTFLOPS ?? 0, bestTFLOPS)
+                snapshot.utilization = peakBudget > 0 ? max(snapshot.utilization ?? 0, (bestTFLOPS / peakBudget) * 100.0) : snapshot.utilization
+                snapshot.evidenceSources.append("local sweep")
+                snapshot.notes.append("Verified from private local sweep logs.")
+                snapshot.logPath = rawDirectory.appendingPathComponent("inmem_peak_run.log").path
+            }
+        }
+
+        if let text = rawText("test_qos_sweep_run.log"), let summary = parseQosSweepSummary(text) {
+            upsert(id: "test_qos_sweep", fallbackTitle: "QoS Sweep", defaultState: .warning) { snapshot in
+                snapshot.bestTFLOPS = max(snapshot.bestTFLOPS ?? 0, summary.aneTFLOPS ?? 0)
+                snapshot.utilization = max(snapshot.utilization ?? 0, summary.aneUtilization ?? 0)
+                snapshot.avgStepMS = summary.avgStepMS
+                snapshot.evidenceSources.append("local sweep")
+                snapshot.notes.append("Small probe only. Good for timing and compile/load behavior, not peak ANE saturation.")
+                snapshot.logPath = rawDirectory.appendingPathComponent("test_qos_sweep_run.log").path
+            }
+        }
+
+        let localFailureNotes: [(String, String, String, String)] = [
+            ("inmem_bench", "In-memory Benchmark Sweep", "inmem_bench_run.log", "All rows return FAIL(-1) on this machine."),
+            ("sram_bench", "SRAM Benchmark", "sram_bench_run.log", "All rows return FAIL(-1) on this machine."),
+            ("sram_probe", "SRAM Probe", "sram_probe_run.log", "SRAM probe returns -1.000 ms / 0.00 TFLOPS across the sweep on this machine."),
+            ("inmem_basic", "In-memory Basic Probe", "inmem_basic_run.log", "Runtime reports Compile failed on this machine."),
+            ("test_weight_reload", "Weight Reload Probe", "test_weight_reload_run.log", "Weight reload still does not change output without recompilation."),
+            ("test_perf_stats", "Performance Stats Probe", "test_perf_stats_run.log", "_ANEPerformanceStats exists but alloc/init returns nil on this machine."),
+            ("test_ane_advanced", "Advanced ANE Probe", "test_ane_advanced_run.log", "weightsBuffer leaves output unchanged here; procedureIndex 0-15 all evaluate successfully."),
+        ]
+
+        for (id, title, logName, note) in localFailureNotes {
+            let logPath = rawDirectory.appendingPathComponent(logName).path
+            guard FileManager.default.fileExists(atPath: logPath) else {
+                continue
+            }
+            upsert(id: id, fallbackTitle: title, defaultState: .warning) { snapshot in
+                snapshot.evidenceSources.append("local sweep")
+                snapshot.notes.append(note)
+                snapshot.logPath = logPath
+                if id == "inmem_bench" || id == "sram_bench" || id == "sram_probe" || id == "inmem_basic" {
+                    snapshot.state = .failure
+                }
+            }
+        }
+    }
+
+    let groupedHistory = Dictionary(grouping: history) { record in
+        record.experimentID ?? record.mode
+    }
+
+    for (id, records) in groupedHistory {
+        let successful = records.filter { $0.exitCode == 0 }
+        let latest = records.max { $0.endedAt < $1.endedAt }
+        let latestSuccess = successful.max { $0.endedAt < $1.endedAt }
+        let historyBestTFLOPS = successful.compactMap(\.aneTFLOPS).max()
+        let historyBestUtil = successful.compactMap(\.aneUtilization).max()
+        let historyBestMS = successful.compactMap(\.avgTrainMS).min()
+        let fallbackTitle = latest?.title ?? experimentsByID[id]?.title ?? id
+
+        upsert(
+            id: id,
+            fallbackTitle: fallbackTitle,
+            defaultState: successful.isEmpty ? .failure : .history
+        ) { snapshot in
+            snapshot.evidenceSources.append("run history")
+            snapshot.historyRunCount = records.count
+            if snapshot.bestTFLOPS == nil, let historyBestTFLOPS {
+                snapshot.bestTFLOPS = historyBestTFLOPS
+            } else if let historyBestTFLOPS {
+                snapshot.bestTFLOPS = max(snapshot.bestTFLOPS ?? 0, historyBestTFLOPS)
+            }
+            if snapshot.utilization == nil, let historyBestUtil {
+                snapshot.utilization = historyBestUtil
+            } else if let historyBestUtil {
+                snapshot.utilization = max(snapshot.utilization ?? 0, historyBestUtil)
+            }
+            if snapshot.avgStepMS == nil, let historyBestMS {
+                snapshot.avgStepMS = historyBestMS
+            } else if let historyBestMS {
+                snapshot.avgStepMS = min(snapshot.avgStepMS ?? historyBestMS, historyBestMS)
+            }
+            if snapshot.state == .history && successful.isEmpty {
+                snapshot.state = .failure
+            }
+            if snapshot.state == .blocked, successful.isEmpty == false {
+                snapshot.state = .history
+            }
+            if let latest {
+                let formatter = RelativeDateTimeFormatter()
+                formatter.unitsStyle = .short
+                let relative = formatter.localizedString(for: latest.endedAt, relativeTo: Date())
+                let outcome = latest.exitCode == 0 ? "ok" : "failed(\(latest.exitCode))"
+                snapshot.notes.append("Last history run \(relative): \(outcome).")
+                snapshot.telemetryLabel = latest.telemetrySource
+            }
+            if let head = latestSuccess?.repoHead, !head.isEmpty {
+                snapshot.notes.append("Best stored result from HEAD \(head).")
+            }
+        }
+    }
+
+    return snapshots.values.sorted { lhs, rhs in
+        if lhs.sortRank == rhs.sortRank {
+            return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        }
+        return lhs.sortRank < rhs.sortRank
+    }
+}
+
 @MainActor
 private final class ExperimentActionButton: NSButton {
     var experimentID: String = ""
+}
+
+@MainActor
+private final class BenchmarkActionButton: NSButton {
+    var benchmarkID: String = ""
+    var payload: String = ""
 }
 
 @MainActor
@@ -1346,9 +1642,15 @@ private final class TelemetryWindowController: NSWindowController {
         metricsView.push(sample)
     }
 
-    func updateContext(repoProfile: RepoProfile, repoRoot: String, currentRunTitle: String?, telemetrySource: String?) {
+    func updateContext(
+        repoProfile: RepoProfile,
+        repoRoot: String,
+        currentRunTitle: String?,
+        telemetrySource: String?,
+        powerStatus: String?
+    ) {
         headlineLabel.stringValue = currentRunTitle.map { "ANEBar Telemetry | \($0)" } ?? "ANEBar Telemetry"
-        detailLabel.stringValue = "Profile \(repoProfile.label) | \(telemetrySource ?? "idle") | \(abbreviatedPath(repoRoot, maxLength: 72))"
+        detailLabel.stringValue = "Profile \(repoProfile.label) | \(telemetrySource ?? "idle") | Power \(powerStatus ?? "idle") | \(abbreviatedPath(repoRoot, maxLength: 72))"
     }
 
     private func setupUI() {
@@ -2016,6 +2318,264 @@ private final class HistoryWindowController: NSWindowController {
 }
 
 @MainActor
+private final class BenchmarksWindowController: NSWindowController {
+    private let summaryLabel = NSTextField(labelWithString: "ANEBar Benchmarks")
+    private let detailLabel = NSTextField(labelWithString: "Verified results from local sweep logs and stored runs.")
+    private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
+    private let openSummaryButton = NSButton(title: "Open Summary", target: nil, action: nil)
+    private let scrollView = NSScrollView()
+    private let contentStack = NSStackView()
+
+    private var snapshots: [VerifiedBenchmarkSnapshot] = []
+    private var snapshotsByID: [String: VerifiedBenchmarkSnapshot] = [:]
+    private var runButtons: [BenchmarkActionButton] = []
+    private var copyButtons: [BenchmarkActionButton] = []
+    private var isBusy: Bool = false
+
+    var onRunBenchmark: ((String) -> Void)?
+    var onCopyCommand: ((String) -> String?)?
+    var onOpenPath: ((String) -> Void)?
+    var onRefresh: (() -> Void)?
+    var onOpenSummary: (() -> Void)?
+
+    override init(window: NSWindow?) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 820, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "ANEBar Verified Benchmarks"
+        window.minSize = NSSize(width: 700, height: 560)
+        super.init(window: window)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    func update(repoRoot: String, snapshots: [VerifiedBenchmarkSnapshot]) {
+        self.snapshots = snapshots
+        snapshotsByID = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.id, $0) })
+        summaryLabel.stringValue = "Verified Benchmarks | \(snapshots.count) entries"
+        detailLabel.stringValue = "Peak budget \(String(format: "%.1f", configuredPeakTFLOPS())) TFLOPS | \(abbreviatedPath(repoRoot, maxLength: 72))"
+        rebuildContent()
+    }
+
+    func setBusy(_ busy: Bool) {
+        isBusy = busy
+        for button in runButtons {
+            let canRun = snapshotsByID[button.benchmarkID]?.canRun == true
+            button.isEnabled = !busy && canRun
+        }
+        for button in copyButtons {
+            let canCopy = snapshotsByID[button.benchmarkID]?.experimentID != nil
+            button.isEnabled = canCopy
+        }
+    }
+
+    private func setupUI() {
+        guard let contentView = window?.contentView else {
+            return
+        }
+
+        summaryLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+        detailLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        detailLabel.textColor = .secondaryLabelColor
+
+        refreshButton.target = self
+        refreshButton.action = #selector(refreshPressed)
+        openSummaryButton.target = self
+        openSummaryButton.action = #selector(openSummaryPressed)
+
+        let headerStack = NSStackView(views: [summaryLabel, NSView(), openSummaryButton, refreshButton])
+        headerStack.orientation = .horizontal
+        headerStack.alignment = .centerY
+        headerStack.spacing = 10
+
+        contentStack.orientation = .vertical
+        contentStack.spacing = 12
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let documentView = NSView()
+        documentView.translatesAutoresizingMaskIntoConstraints = false
+        documentView.addSubview(contentStack)
+
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.documentView = documentView
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            contentStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            contentStack.topAnchor.constraint(equalTo: documentView.topAnchor),
+            contentStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
+            contentStack.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+        ])
+
+        let root = NSStackView(views: [headerStack, detailLabel, scrollView])
+        root.orientation = .vertical
+        root.spacing = 10
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        contentView.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
+            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -16),
+        ])
+    }
+
+    private func rebuildContent() {
+        runButtons = []
+        copyButtons = []
+        for view in contentStack.arrangedSubviews {
+            contentStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        if snapshots.isEmpty {
+            let empty = NSTextField(labelWithString: "No verified benchmark evidence found yet.")
+            empty.textColor = .secondaryLabelColor
+            contentStack.addArrangedSubview(empty)
+            return
+        }
+
+        for snapshot in snapshots {
+            contentStack.addArrangedSubview(makeCard(for: snapshot))
+        }
+        setBusy(isBusy)
+    }
+
+    private func makeCard(for snapshot: VerifiedBenchmarkSnapshot) -> NSView {
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 14
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.44).cgColor
+
+        let titleLabel = NSTextField(labelWithString: snapshot.title)
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+
+        let stateLabel = NSTextField(labelWithString: " \(snapshot.state.label) ")
+        stateLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        stateLabel.textColor = .labelColor
+        stateLabel.wantsLayer = true
+        stateLabel.layer?.cornerRadius = 8
+        stateLabel.layer?.borderWidth = 1
+        stateLabel.layer?.borderColor = snapshot.state.strokeColor.cgColor
+        stateLabel.layer?.backgroundColor = snapshot.state.fillColor.cgColor
+
+        let headerRow = NSStackView(views: [titleLabel, NSView(), stateLabel])
+        headerRow.orientation = .horizontal
+        headerRow.alignment = .centerY
+        headerRow.spacing = 10
+
+        let evidence = snapshot.evidenceSources.isEmpty ? "none" : snapshot.evidenceSources.joined(separator: " + ")
+        var metaParts: [String] = ["Evidence: \(evidence)"]
+        if snapshot.historyRunCount > 0 {
+            metaParts.append("runs \(snapshot.historyRunCount)")
+        }
+        if let telemetryLabel = snapshot.telemetryLabel, !telemetryLabel.isEmpty {
+            metaParts.append(telemetryLabel)
+        }
+        let metaLabel = NSTextField(labelWithString: metaParts.joined(separator: " | "))
+        metaLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        metaLabel.textColor = .tertiaryLabelColor
+
+        var metricParts: [String] = []
+        if let bestTFLOPS = snapshot.bestTFLOPS {
+            metricParts.append(String(format: "Peak %.2f TFLOPS", bestTFLOPS))
+        }
+        if let utilization = snapshot.utilization {
+            metricParts.append(String(format: "Util %.1f%%", utilization))
+        }
+        if let avgStepMS = snapshot.avgStepMS {
+            metricParts.append(String(format: "Avg %.2f ms", avgStepMS))
+        }
+        let metricLabel = NSTextField(labelWithString: metricParts.isEmpty ? "Metrics: n/a" : metricParts.joined(separator: " | "))
+        metricLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        metricLabel.textColor = .labelColor
+
+        var notes = snapshot.notes
+        if let blockedReason = snapshot.blockedReason, !blockedReason.isEmpty {
+            notes.append("Missing: \(blockedReason)")
+        }
+        let noteLabel = NSTextField(wrappingLabelWithString: notes.isEmpty ? "No notes yet." : notes.joined(separator: " "))
+        noteLabel.font = .systemFont(ofSize: 12)
+        noteLabel.textColor = .secondaryLabelColor
+
+        let runButton = BenchmarkActionButton(title: snapshot.canRun ? "Run Experiment" : "Blocked", target: self, action: #selector(runPressed(_:)))
+        runButton.benchmarkID = snapshot.id
+        runButton.isEnabled = snapshot.canRun
+        runButtons.append(runButton)
+
+        let copyButton = BenchmarkActionButton(title: "Copy Command", target: self, action: #selector(copyPressed(_:)))
+        copyButton.benchmarkID = snapshot.id
+        copyButton.isEnabled = snapshot.experimentID != nil
+        copyButtons.append(copyButton)
+
+        let openLogButton = BenchmarkActionButton(title: "Open Evidence", target: self, action: #selector(openEvidencePressed(_:)))
+        openLogButton.benchmarkID = snapshot.id
+        openLogButton.payload = snapshot.logPath ?? ""
+        openLogButton.isEnabled = snapshot.logPath != nil
+
+        let buttonStack = NSStackView(views: [runButton, copyButton, openLogButton])
+        buttonStack.orientation = .horizontal
+        buttonStack.spacing = 8
+
+        let root = NSStackView(views: [headerRow, metaLabel, metricLabel, noteLabel, buttonStack])
+        root.orientation = .vertical
+        root.spacing = 8
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            root.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            root.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            root.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
+        ])
+
+        return card
+    }
+
+    @objc private func refreshPressed() {
+        onRefresh?()
+    }
+
+    @objc private func openSummaryPressed() {
+        onOpenSummary?()
+    }
+
+    @objc private func runPressed(_ sender: BenchmarkActionButton) {
+        onRunBenchmark?(sender.benchmarkID)
+    }
+
+    @objc private func copyPressed(_ sender: BenchmarkActionButton) {
+        let text = onCopyCommand?(sender.benchmarkID) ?? ""
+        guard !text.isEmpty else {
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        detailLabel.stringValue = "Copied command for \(snapshotsByID[sender.benchmarkID]?.title ?? sender.benchmarkID)"
+    }
+
+    @objc private func openEvidencePressed(_ sender: BenchmarkActionButton) {
+        guard !sender.payload.isEmpty else {
+            return
+        }
+        onOpenPath?(sender.payload)
+    }
+}
+
+@MainActor
 private final class ChatWindowController: NSWindowController {
     private enum DefaultsKey {
         static let chatModel = "anebar_chat_model"
@@ -2359,6 +2919,150 @@ private final class ChatWindowController: NSWindowController {
         let elapsed = max(0.001, Date().timeIntervalSince(started))
         let tokPerSec = Double(streamTokenApproxCount) / elapsed
         statusLabel.stringValue = String(format: "Streaming... %.1f tok/s (approx)", tokPerSec)
+    }
+}
+
+private struct PowerMetricsSnapshot {
+    var timestamp: Date
+    var aneWatts: Double?
+    var cpuWatts: Double?
+    var gpuWatts: Double?
+}
+
+@MainActor
+private final class PowerMetricsSampler {
+    private var process: Process?
+    private var latestSnapshot: PowerMetricsSnapshot?
+    private var bufferedText = ""
+    private var stopRequested = false
+    private var statusText = "idle"
+
+    func start() {
+        guard process == nil else {
+            return
+        }
+
+        stopRequested = false
+        statusText = "starting"
+        bufferedText = ""
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        proc.arguments = [
+            "-n",
+            "/usr/bin/powermetrics",
+            "--samplers", "cpu_power,gpu_power,ane_power",
+            "-i", "1000",
+            "-b", "1",
+        ]
+
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else {
+                return
+            }
+            Task { @MainActor in
+                self?.consume(text)
+            }
+        }
+
+        proc.terminationHandler = { [weak self, weak pipe] finished in
+            Task { @MainActor in
+                pipe?.fileHandleForReading.readabilityHandler = nil
+                guard let self else {
+                    return
+                }
+                self.process = nil
+                if self.stopRequested {
+                    self.statusText = "idle"
+                    return
+                }
+                if self.bufferedText.contains("a password is required") || self.bufferedText.contains("must be invoked as the superuser") {
+                    self.statusText = "unavailable (sudo required)"
+                } else if finished.terminationStatus != 0 && self.latestSnapshot == nil {
+                    self.statusText = "unavailable"
+                } else if self.latestSnapshot == nil {
+                    self.statusText = "idle"
+                }
+            }
+        }
+
+        do {
+            try proc.run()
+            process = proc
+        } catch {
+            process = nil
+            statusText = "launch failed"
+        }
+    }
+
+    func stop() {
+        stopRequested = true
+        process?.terminate()
+        process = nil
+    }
+
+    func currentSnapshot(maxAge: TimeInterval = 5) -> PowerMetricsSnapshot? {
+        guard let latestSnapshot else {
+            return nil
+        }
+        guard Date().timeIntervalSince(latestSnapshot.timestamp) <= maxAge else {
+            return nil
+        }
+        return latestSnapshot
+    }
+
+    func statusLineText() -> String {
+        if let snapshot = currentSnapshot() {
+            let ane = snapshot.aneWatts.map { String(format: "%.1fW", $0) } ?? "n/a"
+            let cpu = snapshot.cpuWatts.map { String(format: "%.1fW", $0) } ?? "n/a"
+            let gpu = snapshot.gpuWatts.map { String(format: "%.1fW", $0) } ?? "n/a"
+            return "ANE \(ane) | CPU \(cpu) | GPU \(gpu)"
+        }
+        return statusText
+    }
+
+    private func consume(_ text: String) {
+        bufferedText.append(text)
+        if bufferedText.count > 8192 {
+            bufferedText = String(bufferedText.suffix(4096))
+        }
+
+        if bufferedText.contains("a password is required") || bufferedText.contains("must be invoked as the superuser") {
+            statusText = "unavailable (sudo required)"
+            return
+        }
+
+        let snapshot = PowerMetricsSnapshot(
+            timestamp: Date(),
+            aneWatts: captureLastMilliwatts(for: #"ANE Power:\s+([\d.]+)\s*mW"#),
+            cpuWatts: captureLastMilliwatts(for: #"CPU Power:\s+([\d.]+)\s*mW"#),
+            gpuWatts: captureLastMilliwatts(for: #"GPU Power:\s+([\d.]+)\s*mW"#)
+        )
+
+        if snapshot.aneWatts != nil || snapshot.cpuWatts != nil || snapshot.gpuWatts != nil {
+            latestSnapshot = snapshot
+            statusText = "live"
+        }
+    }
+
+    private func captureLastMilliwatts(for pattern: String) -> Double? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let range = NSRange(bufferedText.startIndex..<bufferedText.endIndex, in: bufferedText)
+        let matches = regex.matches(in: bufferedText, options: [], range: range)
+        guard let match = matches.last, match.numberOfRanges > 1,
+              let valueRange = Range(match.range(at: 1), in: bufferedText),
+              let milliwatts = Double(bufferedText[valueRange])
+        else {
+            return nil
+        }
+        return milliwatts / 1000.0
     }
 }
 
@@ -2809,6 +3513,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private var repoLineItem = NSMenuItem()
     private var profileLineItem = NSMenuItem()
     private var telemetryLineItem = NSMenuItem()
+    private var powerLineItem = NSMenuItem()
     private var guardrailItem = NSMenuItem()
 
     private var upstreamHeadItem = NSMenuItem()
@@ -2829,6 +3534,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private var telemetryWindowController: TelemetryWindowController?
     private var experimentsWindowController: ExperimentConsoleWindowController?
     private var historyWindowController: HistoryWindowController?
+    private var benchmarksWindowController: BenchmarksWindowController?
     private var chatWindowController: ChatWindowController?
 
     private let historyStore = RunHistoryStore()
@@ -2852,6 +3558,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private var lastExitCode: Int32?
 
     private var metricsSampler = SystemMetricsSampler()
+    private var powerSampler = PowerMetricsSampler()
     private var metricsTimer: Timer?
     private var latestMetrics: LiveMetricsSample?
 
@@ -2920,6 +3627,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         metricsTimer?.invalidate()
         metricsTimer = nil
+        powerSampler.stop()
     }
 
     @objc private func noopMenuItemAction(_ sender: Any?) {}
@@ -3034,6 +3742,10 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         telemetryLineItem = NSMenuItem(title: "Telemetry: idle", action: nil, keyEquivalent: "")
         configureInfoItem(telemetryLineItem)
         menu.addItem(telemetryLineItem)
+
+        powerLineItem = NSMenuItem(title: "Power: idle", action: nil, keyEquivalent: "")
+        configureInfoItem(powerLineItem)
+        menu.addItem(powerLineItem)
 
         guardrailItem = NSMenuItem(title: "Guardrails: checking…", action: nil, keyEquivalent: "")
         configureInfoItem(guardrailItem)
@@ -3157,6 +3869,10 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         openHistoryJSONItem.target = self
         reportsSubmenu.addItem(openHistoryJSONItem)
 
+        let openBenchmarksItem = NSMenuItem(title: "Open Verified Benchmarks", action: #selector(openBenchmarkPanel), keyEquivalent: "v")
+        openBenchmarksItem.target = self
+        reportsSubmenu.addItem(openBenchmarksItem)
+
         let exportBundleItem = NSMenuItem(title: "Export Repro Bundle", action: #selector(exportReproBundle), keyEquivalent: "e")
         exportBundleItem.target = self
         reportsSubmenu.addItem(exportBundleItem)
@@ -3214,6 +3930,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         }
         refreshRepoContext()
         refreshTelemetryLine()
+        refreshPowerLine()
         refreshGuardrailLine()
         refreshModelIndex(force: true)
         refreshUpstreamInfo(force: true)
@@ -3231,7 +3948,14 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         queueBenchmarkItem.isEnabled = !running
         experimentsWindowController?.setBusy(running)
         historyWindowController?.setBusy(running)
+        benchmarksWindowController?.setBusy(running)
         statusLineItem.title = "Status: \(message)"
+        if running {
+            powerSampler.start()
+        } else {
+            powerSampler.stop()
+        }
+        refreshPowerLine()
         updateStatusButton()
     }
 
@@ -3248,8 +3972,10 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             repoProfile: repoProfile,
             repoRoot: repoRoot,
             currentRunTitle: currentRunTitle,
-            telemetrySource: currentRunTelemetrySource ?? lastTelemetrySource
+            telemetrySource: currentRunTelemetrySource ?? lastTelemetrySource,
+            powerStatus: powerSampler.statusLineText()
         )
+        refreshBenchmarkWindow()
     }
 
     private func refreshTelemetryLine() {
@@ -3259,8 +3985,23 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             repoProfile: repoProfile,
             repoRoot: repoRoot,
             currentRunTitle: currentRunTitle,
-            telemetrySource: source
+            telemetrySource: source,
+            powerStatus: powerSampler.statusLineText()
         )
+    }
+
+    private func refreshPowerLine() {
+        powerLineItem.title = "Power: \(powerSampler.statusLineText())"
+    }
+
+    private func refreshBenchmarkWindow() {
+        let snapshots = buildVerifiedBenchmarks(
+            repoRoot: repoRoot,
+            experiments: experimentCatalog,
+            history: historyStore.records
+        )
+        benchmarksWindowController?.update(repoRoot: repoRoot, snapshots: snapshots)
+        benchmarksWindowController?.setBusy(process != nil)
     }
 
     private func setTelemetrySource(_ source: String, persistAsLast: Bool = true) {
@@ -3659,13 +4400,47 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             repoProfile: repoProfile,
             repoRoot: repoRoot,
             currentRunTitle: currentRunTitle,
-            telemetrySource: currentRunTelemetrySource ?? lastTelemetrySource
+            telemetrySource: currentRunTelemetrySource ?? lastTelemetrySource,
+            powerStatus: powerSampler.statusLineText()
         )
         if let latestMetrics {
             telemetryWindowController?.push(sample: latestMetrics)
         }
         telemetryWindowController?.showWindow(nil)
         telemetryWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        reopenMenuIfNeeded()
+    }
+
+    @objc private func openBenchmarkPanel() {
+        if benchmarksWindowController == nil {
+            let controller = BenchmarksWindowController()
+            controller.onRunBenchmark = { [weak self] benchmarkID in
+                guard let self, let experiment = self.experimentByID(benchmarkID) else {
+                    return
+                }
+                self.runExperiment(experiment)
+            }
+            controller.onCopyCommand = { [weak self] benchmarkID in
+                guard let self, let experiment = self.experimentByID(benchmarkID) else {
+                    return nil
+                }
+                return self.copyCommandForExperiment(experiment)
+            }
+            controller.onOpenPath = { path in
+                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+            }
+            controller.onRefresh = { [weak self] in
+                self?.refreshInfoLines()
+            }
+            controller.onOpenSummary = { [weak self] in
+                self?.openBenchmarkSummary()
+            }
+            benchmarksWindowController = controller
+        }
+        refreshBenchmarkWindow()
+        benchmarksWindowController?.showWindow(nil)
+        benchmarksWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         reopenMenuIfNeeded()
     }
@@ -3921,6 +4696,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         latestMetrics = sample
         metricsView.push(sample)
         telemetryWindowController?.push(sample: sample)
+        refreshPowerLine()
         refreshGuardrailLine()
         updateStatusButton()
     }
@@ -4320,8 +5096,30 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         lines.append("Generated: \(ISO8601DateFormatter().string(from: Date()))")
         lines.append("")
 
+        let verified = buildVerifiedBenchmarks(
+            repoRoot: repoRoot,
+            experiments: experimentCatalog,
+            history: historyStore.records
+        )
+        if !verified.isEmpty {
+            lines.append("## Verified Evidence")
+            lines.append("")
+            lines.append("| Benchmark | State | Peak TFLOPS | Util % | Avg ms | Evidence |")
+            lines.append("|---|---|---:|---:|---:|---|")
+            for snapshot in verified {
+                let tflops = snapshot.bestTFLOPS.map { String(format: "%.2f", $0) } ?? "-"
+                let util = snapshot.utilization.map { String(format: "%.2f", $0) } ?? "-"
+                let avg = snapshot.avgStepMS.map { String(format: "%.2f", $0) } ?? "-"
+                let evidence = snapshot.evidenceSources.isEmpty ? "-" : snapshot.evidenceSources.joined(separator: ", ")
+                lines.append("| \(snapshot.title) | \(snapshot.state.label) | \(tflops) | \(util) | \(avg) | \(evidence) |")
+            }
+            lines.append("")
+        }
+
         let runs = historyStore.records.filter { $0.exitCode == 0 }
         if runs.isEmpty {
+            lines.append("## Run History")
+            lines.append("")
             lines.append("No successful runs yet.")
             try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
             return url
@@ -4331,6 +5129,8 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         let bestUtil = runs.compactMap(\.aneUtilization).max()
         let bestLatency = runs.compactMap(\.avgTrainMS).min()
 
+        lines.append("## Run History")
+        lines.append("")
         lines.append("- Successful runs: \(runs.count)")
         lines.append(bestTFLOPS != nil ? String(format: "- Best ANE TFLOPS: %.2f", bestTFLOPS!) : "- Best ANE TFLOPS: n/a")
         lines.append(bestUtil != nil ? String(format: "- Best Utilization: %.2f%%", bestUtil!) : "- Best Utilization: n/a")
@@ -4359,6 +5159,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         let recent = historyStore.recent(limit: 2)
         historyWindowController?.update(records: historyStore.recentDescending(limit: 120), repoRoot: repoRoot)
         historyWindowController?.setBusy(process != nil)
+        refreshBenchmarkWindow()
         guard let latest = recent.last else {
             historySummaryItem.title = "Run history: none"
             historyDetailItem.title = "Last metrics: n/a"

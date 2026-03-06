@@ -18,8 +18,9 @@ It is built for daily research + social publishing workflows: run experiments, m
   - P-core usage
   - E-core usage
   - memory usage
-  - ANE utilization and TFLOPS (when emitted by the pipeline)
-  - fallback extraction from research result files when stdout metrics are absent
+  - ANE utilization and TFLOPS only when emitted by a live pipeline
+  - artifact summaries stay in history/benchmark reporting and no longer pretend to be live ANE load
+  - optional `powermetrics` power line for ANE/CPU/GPU rails when `sudo -n powermetrics` is available
 - Visual density controls:
   - compact menu layout toggle (default on)
   - compact menubar label toggle (default on)
@@ -28,6 +29,7 @@ It is built for daily research + social publishing workflows: run experiments, m
 - Dedicated operator panels:
   - experiment console
   - telemetry panel
+  - verified benchmark panel
   - history + compare panel
 - Guardrails for heavier runs (battery + thermal checks)
 - Local chat panel:
@@ -36,6 +38,7 @@ It is built for daily research + social publishing workflows: run experiments, m
   - runs through configurable ANE runtime command templates (repo-native)
   - template placeholders: `{model}`, `{prompt}`, `{repo}`
 - Repro bundle export + benchmark summary markdown for repeatable reporting
+- Verified benchmark evidence from private local sweep logs plus stored run history
 - Model tracker:
   - continuously scans the selected ANE repo
   - tracks common model artifact types (`.safetensors`, `.gguf`, `.onnx`, `.mlmodel`, `.mlpackage`, `.pt`, `.pth`, `.bin`)
@@ -166,7 +169,10 @@ This uses `.private/` (gitignored) for local-only mirrors such as CodexBar and A
   - verify `uv --version`
   - verify ANE repo path in app menu
 - ANE metrics show `n/a`:
-  - ANE values are parsed from pipeline output (`ANE utilization` / `ANE TFLOPS`)
+  - ANE values are only shown live when the pipeline emits `ANE utilization` / `ANE TFLOPS`
+- Power line shows `unavailable (sudo required)`:
+  - `powermetrics` needs superuser access on macOS
+  - configure passwordless `powermetrics` only if you explicitly want live rail power in the bar
 - Model tracker count looks wrong:
   - use `Refresh Model Index` in the menu
 
