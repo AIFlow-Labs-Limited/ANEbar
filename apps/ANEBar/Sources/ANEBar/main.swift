@@ -427,19 +427,31 @@ private struct ExperimentDefinition {
         return parts.joined(separator: " | ")
     }
 
+    private func resolvePlaceholders(in value: String, repoRoot: String) -> String {
+        var resolved = value.replacingOccurrences(of: "{repo}", with: repoRoot)
+        if let anebarRoot = aneBarWorkspaceRoot() {
+            resolved = resolved.replacingOccurrences(of: "{anebar}", with: anebarRoot)
+        }
+        return resolved
+    }
+
     func resolvedWorkingDirectory(repoRoot: String) -> String {
-        workingDirectory.replacingOccurrences(of: "{repo}", with: repoRoot)
+        resolvePlaceholders(in: workingDirectory, repoRoot: repoRoot)
     }
 
     func resolvedCommand(repoRoot: String) -> String? {
         guard let runCommand else {
             return nil
         }
-        let build = buildCommand?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let build = resolvePlaceholders(
+            in: buildCommand?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            repoRoot: repoRoot
+        )
+        let run = resolvePlaceholders(in: runCommand, repoRoot: repoRoot)
         if build.isEmpty || build == "true" {
-            return runCommand
+            return run
         }
-        return "\(build) && \(runCommand)"
+        return "\(build) && \(run)"
     }
 }
 
@@ -673,6 +685,24 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
         sourcePath: "bridge/Makefile",
         advanced: true
     ))
+
+    if let anebarRoot = aneBarWorkspaceRoot(),
+       fileManager.fileExists(atPath: "\(anebarRoot)/scripts/run_verified_sweep.sh")
+    {
+        experiments.append(
+            ExperimentDefinition(
+                id: "verified_sweep",
+                title: "Verified Local Sweep",
+                summary: "Runs the ANEBar-owned validation sweep and refreshes private benchmark evidence from the current ANE checkout.",
+                group: .lab,
+                workingDirectory: "{anebar}",
+                buildCommand: nil,
+                runCommand: "bash scripts/run_verified_sweep.sh {repo}",
+                telemetry: "log capture + benchmark evidence",
+                sourcePath: "scripts/run_verified_sweep.sh"
+            )
+        )
+    }
 
     if profile.kind == .labEnhanced, has("training/research/run_research.py") {
         experiments.append(
@@ -1539,6 +1569,20 @@ private func buildVerifiedBenchmarks(
                 }
             }
         }
+
+        if let text = rawText("train_large_run.log") {
+            upsert(id: "train_large", fallbackTitle: "Static Training Baseline", defaultState: .blocked) { snapshot in
+                snapshot.evidenceSources.append("local sweep")
+                snapshot.logPath = rawDirectory.appendingPathComponent("train_large_run.log").path
+                if text.contains("Cannot open tinystories_data00.bin") {
+                    snapshot.state = .blocked
+                    snapshot.notes.append("Missing training/tinystories_data00.bin blocks local static training runs.")
+                } else {
+                    snapshot.state = .warning
+                    snapshot.notes.append("train_large log captured; inspect evidence for current local behavior.")
+                }
+            }
+        }
     }
 
     let groupedHistory = Dictionary(grouping: history) { record in
@@ -1602,6 +1646,38 @@ private func buildVerifiedBenchmarks(
         }
         return lhs.sortRank < rhs.sortRank
     }
+}
+
+private func benchmarkOverviewText(_ snapshots: [VerifiedBenchmarkSnapshot]) -> String {
+    guard !snapshots.isEmpty else {
+        return "No verified benchmark evidence yet."
+    }
+
+    var parts: [String] = []
+    if let peak = snapshots
+        .filter({ $0.bestTFLOPS != nil })
+        .max(by: { ($0.bestTFLOPS ?? 0) < ($1.bestTFLOPS ?? 0) }),
+       let bestTFLOPS = peak.bestTFLOPS
+    {
+        let util = peak.utilization.map { String(format: "%.1f%%", $0) } ?? "n/a"
+        parts.append(String(format: "%@ hit %.2f TFLOPS (%@ of a %.1f TF budget)", peak.title, bestTFLOPS, util, configuredPeakTFLOPS()))
+    }
+
+    if let qos = snapshots.first(where: { $0.id == "test_qos_sweep" }),
+       let qosTFLOPS = qos.bestTFLOPS
+    {
+        parts.append(String(format: "QoS probe topped out at %.3f TFLOPS, which confirms it is a timing probe rather than a saturation workload", qosTFLOPS))
+    }
+
+    let failures = snapshots
+        .filter { $0.state == .failure }
+        .prefix(3)
+        .map(\.title)
+    if !failures.isEmpty {
+        parts.append("Current local failures: " + failures.joined(separator: ", "))
+    }
+
+    return parts.joined(separator: " | ")
 }
 
 @MainActor
@@ -2321,6 +2397,8 @@ private final class HistoryWindowController: NSWindowController {
 private final class BenchmarksWindowController: NSWindowController {
     private let summaryLabel = NSTextField(labelWithString: "ANEBar Benchmarks")
     private let detailLabel = NSTextField(labelWithString: "Verified results from local sweep logs and stored runs.")
+    private let runSweepButton = NSButton(title: "Run Sweep", target: nil, action: nil)
+    private let copyToplineButton = NSButton(title: "Copy Topline", target: nil, action: nil)
     private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
     private let openSummaryButton = NSButton(title: "Open Summary", target: nil, action: nil)
     private let scrollView = NSScrollView()
@@ -2337,6 +2415,7 @@ private final class BenchmarksWindowController: NSWindowController {
     var onOpenPath: ((String) -> Void)?
     var onRefresh: (() -> Void)?
     var onOpenSummary: (() -> Void)?
+    var onRunSweep: (() -> Void)?
 
     override init(window: NSWindow?) {
         let window = NSWindow(
@@ -2365,6 +2444,8 @@ private final class BenchmarksWindowController: NSWindowController {
 
     func setBusy(_ busy: Bool) {
         isBusy = busy
+        runSweepButton.isEnabled = !busy && onRunSweep != nil
+        copyToplineButton.isEnabled = !snapshots.isEmpty
         for button in runButtons {
             let canRun = snapshotsByID[button.benchmarkID]?.canRun == true
             button.isEnabled = !busy && canRun
@@ -2388,8 +2469,12 @@ private final class BenchmarksWindowController: NSWindowController {
         refreshButton.action = #selector(refreshPressed)
         openSummaryButton.target = self
         openSummaryButton.action = #selector(openSummaryPressed)
+        runSweepButton.target = self
+        runSweepButton.action = #selector(runSweepPressed)
+        copyToplineButton.target = self
+        copyToplineButton.action = #selector(copyToplinePressed)
 
-        let headerStack = NSStackView(views: [summaryLabel, NSView(), openSummaryButton, refreshButton])
+        let headerStack = NSStackView(views: [summaryLabel, NSView(), runSweepButton, copyToplineButton, openSummaryButton, refreshButton])
         headerStack.orientation = .horizontal
         headerStack.alignment = .centerY
         headerStack.spacing = 10
@@ -2550,6 +2635,18 @@ private final class BenchmarksWindowController: NSWindowController {
 
     @objc private func openSummaryPressed() {
         onOpenSummary?()
+    }
+
+    @objc private func runSweepPressed() {
+        onRunSweep?()
+    }
+
+    @objc private func copyToplinePressed() {
+        let text = benchmarkOverviewText(snapshots)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        detailLabel.stringValue = "Copied benchmark topline"
     }
 
     @objc private func runPressed(_ sender: BenchmarkActionButton) {
@@ -4436,6 +4533,12 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             controller.onOpenSummary = { [weak self] in
                 self?.openBenchmarkSummary()
             }
+            controller.onRunSweep = { [weak self] in
+                guard let self, let experiment = self.experimentByID("verified_sweep") else {
+                    return
+                }
+                self.runExperiment(experiment)
+            }
             benchmarksWindowController = controller
         }
         refreshBenchmarkWindow()
@@ -5102,6 +5205,10 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             history: historyStore.records
         )
         if !verified.isEmpty {
+            lines.append("## Social Topline")
+            lines.append("")
+            lines.append(benchmarkOverviewText(verified))
+            lines.append("")
             lines.append("## Verified Evidence")
             lines.append("")
             lines.append("| Benchmark | State | Peak TFLOPS | Util % | Avg ms | Evidence |")

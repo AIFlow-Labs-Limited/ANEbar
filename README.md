@@ -31,6 +31,10 @@ It is built for daily research + social publishing workflows: run experiments, m
   - telemetry panel
   - verified benchmark panel
   - history + compare panel
+- Verified benchmark panel shortcuts:
+  - run the full local verification sweep
+  - copy a post-ready topline from the current evidence set
+  - open raw evidence logs
 - Guardrails for heavier runs (battery + thermal checks)
 - Local chat panel:
   - model selector

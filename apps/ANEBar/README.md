@@ -15,6 +15,10 @@ Minimal macOS menu bar app to control the ANE research workflow.
 - Model intelligence panel (family counts, size buckets, new-in-24h/7d, missing tokenizer/config hints)
 - Guardrails for heavy runs (thermal + battery state)
 - Verified benchmark window backed by local sweep evidence and stored run history
+- Verified benchmark actions:
+  - run the full verification sweep from the app
+  - copy a benchmark topline for X/social posts
+  - open raw evidence logs
 - Dedicated history window for recent runs and quick comparison
 - ANE chat window with model selector and streaming output (configurable ANE runtime command)
 - Keep-menu-open toggle for persistent in-menu control clicks
