@@ -11,6 +11,7 @@ private struct LiveMetricsSample {
     var load1m: Double
     var aneUtilization: Double?
     var aneTFLOPS: Double?
+    var telemetrySource: String
     var runActive: Bool
 }
 
@@ -69,8 +70,12 @@ private struct GitHeadInfo {
 private struct RunRecord: Codable {
     var id: String
     var mode: String
+    var experimentID: String?
+    var group: String?
+    var title: String?
     var command: String
     var repoRoot: String
+    var workingDirectory: String?
     var repoHead: String?
     var startedAt: Date
     var endedAt: Date
@@ -80,6 +85,7 @@ private struct RunRecord: Codable {
     var aneTFLOPS: Double?
     var totalTFLOPS: Double?
     var avgTrainMS: Double?
+    var telemetrySource: String?
 }
 
 private func anebarDataDirectory() -> URL {
@@ -92,6 +98,8 @@ private func anebarDataDirectory() -> URL {
 private struct QueueItem: Codable {
     var id: String
     var preset: String
+    var experimentID: String?
+    var title: String?
     var createdAt: Date
     var scheduledAt: Date
     var startedAt: Date?
@@ -111,10 +119,26 @@ private final class RunQueueStore {
     }
 
     func enqueue(preset: RunPreset, delaySeconds: TimeInterval = 0) -> QueueItem {
+        enqueue(preset: preset, experimentID: "preset.\(preset.rawValue)", title: preset.menuTitle, delaySeconds: delaySeconds)
+    }
+
+    func enqueue(experiment: ExperimentDefinition, delaySeconds: TimeInterval = 0) -> QueueItem {
+        let title = delaySeconds > 0 ? "\(experiment.title) (+\(Int(delaySeconds / 60))m)" : experiment.title
+        return enqueue(
+            preset: .fast,
+            experimentID: experiment.id,
+            title: title,
+            delaySeconds: delaySeconds
+        )
+    }
+
+    private func enqueue(preset: RunPreset, experimentID: String?, title: String?, delaySeconds: TimeInterval) -> QueueItem {
         let now = Date()
         let item = QueueItem(
             id: UUID().uuidString,
             preset: preset.rawValue,
+            experimentID: experimentID,
+            title: title,
             createdAt: now,
             scheduledAt: now.addingTimeInterval(max(0, delaySeconds)),
             startedAt: nil,
@@ -229,6 +253,14 @@ private final class RunHistoryStore {
         Array(records.suffix(limit))
     }
 
+    func recentDescending(limit: Int) -> [RunRecord] {
+        recent(limit: limit).reversed()
+    }
+
+    func record(id: String) -> RunRecord? {
+        records.last { $0.id == id }
+    }
+
     private func load() {
         guard let data = try? Data(contentsOf: fileURL) else {
             records = []
@@ -284,14 +316,407 @@ private enum RunPreset: String {
     }
 }
 
+private enum RepoProfileKind: String {
+    case upstreamMainline = "upstream-mainline"
+    case labEnhanced = "lab-enhanced"
+    case customFork = "custom-fork"
+}
+
+private struct RepoProfile {
+    var kind: RepoProfileKind
+    var label: String
+    var detail: String
+}
+
+private func detectRepoProfile(in repoRoot: String) -> RepoProfile {
+    let fileManager = FileManager.default
+    func has(_ relativePath: String) -> Bool {
+        fileManager.fileExists(atPath: "\(repoRoot)/\(relativePath)")
+    }
+
+    let hasTraining = has("training/Makefile")
+    let hasDynamic = has("training/training_dynamic/Makefile")
+    let hasDashboard = has("training/dashboard.py")
+    let hasResearch = has("training/research/run_research.py")
+    let hasRootProbes = has("inmem_peak.m") || has("sram_probe.m")
+
+    if hasResearch {
+        return RepoProfile(
+            kind: .labEnhanced,
+            label: "lab-enhanced",
+            detail: "Upstream ANE plus private research, charts, and post assets."
+        )
+    }
+
+    if hasTraining || hasDynamic || hasDashboard || hasRootProbes {
+        return RepoProfile(
+            kind: .upstreamMainline,
+            label: "upstream-mainline",
+            detail: "Mainline ANE experiments without the private research stack."
+        )
+    }
+
+    return RepoProfile(
+        kind: .customFork,
+        label: "custom-fork",
+        detail: "Custom layout detected. Capabilities are inferred from files on disk."
+    )
+}
+
+private enum ExperimentGroup: String, CaseIterable {
+    case peak = "Peak"
+    case training = "Training"
+    case dynamic = "Dynamic"
+    case validation = "Validation"
+    case bridge = "Bridge"
+    case lab = "Lab"
+}
+
+private struct ExperimentDefinition {
+    var id: String
+    var title: String
+    var summary: String
+    var group: ExperimentGroup
+    var workingDirectory: String
+    var buildCommand: String?
+    var runCommand: String?
+    var telemetry: String
+    var sourcePath: String?
+    var requiresSudo: Bool = false
+    var advanced: Bool = false
+
+    var isRunnable: Bool {
+        runCommand != nil
+    }
+
+    var runLabel: String {
+        "\(group.rawValue.lowercased())/\(id)"
+    }
+
+    var metadataLine: String {
+        var parts: [String] = ["Telemetry: \(telemetry)"]
+        if requiresSudo {
+            parts.append("sudo")
+        }
+        if advanced {
+            parts.append("advanced")
+        }
+        if !isRunnable {
+            parts.append("catalogued only")
+        }
+        if let sourcePath {
+            parts.append(sourcePath)
+        }
+        return parts.joined(separator: " | ")
+    }
+
+    func resolvedWorkingDirectory(repoRoot: String) -> String {
+        workingDirectory.replacingOccurrences(of: "{repo}", with: repoRoot)
+    }
+
+    func resolvedCommand(repoRoot: String) -> String? {
+        guard let runCommand else {
+            return nil
+        }
+        let build = buildCommand?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if build.isEmpty || build == "true" {
+            return runCommand
+        }
+        return "\(build) && \(runCommand)"
+    }
+}
+
+private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile) -> [ExperimentDefinition] {
+    let fileManager = FileManager.default
+    func has(_ relativePath: String) -> Bool {
+        fileManager.fileExists(atPath: "\(repoRoot)/\(relativePath)")
+    }
+
+    var experiments: [ExperimentDefinition] = []
+
+    func appendIfPresent(
+        _ relativePath: String,
+        experiment: ExperimentDefinition
+    ) {
+        if has(relativePath) {
+            experiments.append(experiment)
+        }
+    }
+
+    appendIfPresent("inmem_basic.m", experiment: ExperimentDefinition(
+        id: "inmem_basic",
+        title: "In-memory Basic Probe",
+        summary: "Quick sanity check for the in-memory ANE model path.",
+        group: .peak,
+        workingDirectory: "{repo}",
+        buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework CoreML -framework IOSurface -ldl -o inmem_basic inmem_basic.m",
+        runCommand: "./inmem_basic",
+        telemetry: "stdout summary",
+        sourcePath: "inmem_basic.m",
+        advanced: true
+    ))
+    appendIfPresent("inmem_peak.m", experiment: ExperimentDefinition(
+        id: "inmem_peak",
+        title: "In-memory Peak Throughput",
+        summary: "High-signal peak probe for the strongest public ANE throughput clips.",
+        group: .peak,
+        workingDirectory: "{repo}",
+        buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework CoreML -framework IOSurface -ldl -o inmem_peak inmem_peak.m",
+        runCommand: "./inmem_peak",
+        telemetry: "stdout summary",
+        sourcePath: "inmem_peak.m"
+    ))
+    appendIfPresent("inmem_bench.m", experiment: ExperimentDefinition(
+        id: "inmem_bench",
+        title: "In-memory Benchmark Sweep",
+        summary: "Broader in-memory benchmark sweep for throughput comparisons.",
+        group: .peak,
+        workingDirectory: "{repo}",
+        buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework IOSurface -ldl -o inmem_bench inmem_bench.m",
+        runCommand: "./inmem_bench",
+        telemetry: "stdout summary",
+        sourcePath: "inmem_bench.m"
+    ))
+    appendIfPresent("sram_bench.m", experiment: ExperimentDefinition(
+        id: "sram_bench",
+        title: "SRAM Benchmark",
+        summary: "Benchmarks SRAM-oriented probe behavior on the current ANE family.",
+        group: .peak,
+        workingDirectory: "{repo}",
+        buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework CoreML -framework IOSurface -ldl -o sram_bench sram_bench.m",
+        runCommand: "./sram_bench",
+        telemetry: "stdout summary",
+        sourcePath: "sram_bench.m"
+    ))
+    appendIfPresent("sram_probe.m", experiment: ExperimentDefinition(
+        id: "sram_probe",
+        title: "SRAM Probe",
+        summary: "Low-level SRAM probe useful for architecture exploration and failure reports.",
+        group: .peak,
+        workingDirectory: "{repo}",
+        buildCommand: "xcrun clang -O2 -Wall -fobjc-arc -framework Foundation -framework IOSurface -ldl -o sram_probe sram_probe.m",
+        runCommand: "./sram_probe",
+        telemetry: "stdout summary",
+        sourcePath: "sram_probe.m",
+        advanced: true
+    ))
+
+    appendIfPresent("training/train_large.m", experiment: ExperimentDefinition(
+        id: "train_large",
+        title: "Static Training Baseline",
+        summary: "Mainline baseline training path with JSON step and perf telemetry on stderr.",
+        group: .training,
+        workingDirectory: "{repo}",
+        buildCommand: "make -C training train_large",
+        runCommand: "./training/train_large --steps 100 --lr 1e-4",
+        telemetry: "stderr JSON + stdout summary",
+        sourcePath: "training/train_large.m"
+    ))
+    appendIfPresent("training/train_large_ane.m", experiment: ExperimentDefinition(
+        id: "train_large_ane",
+        title: "Static Training + ANE Extras",
+        summary: "Mainline training path with ANE-offloaded extras and final throughput summaries.",
+        group: .training,
+        workingDirectory: "{repo}",
+        buildCommand: "make -C training train_large_ane",
+        runCommand: "./training/train_large_ane --steps 100 --lr 1e-4",
+        telemetry: "stdout summary",
+        sourcePath: "training/train_large_ane.m"
+    ))
+    appendIfPresent("training/dashboard.py", experiment: ExperimentDefinition(
+        id: "dashboard_ane",
+        title: "Dashboard ANE Mode",
+        summary: "Live terminal dashboard for the static path with optional powermetrics integration.",
+        group: .training,
+        workingDirectory: "{repo}/training",
+        buildCommand: nil,
+        runCommand: "uv run --with blessed --with psutil --with numpy python dashboard.py --ane",
+        telemetry: "dashboard stream + powermetrics",
+        sourcePath: "training/dashboard.py",
+        requiresSudo: true
+    ))
+
+    appendIfPresent("training/training_dynamic/train.m", experiment: ExperimentDefinition(
+        id: "train_dynamic",
+        title: "Dynamic Training Pipeline",
+        summary: "Mainline dynamic-weight training path for newer runtime exploration.",
+        group: .dynamic,
+        workingDirectory: "{repo}/training/training_dynamic",
+        buildCommand: "make train",
+        runCommand: "./train --steps 200 --lr 1e-4",
+        telemetry: "stdout summary",
+        sourcePath: "training/training_dynamic/train.m"
+    ))
+    appendIfPresent("training/dashboard.py", experiment: ExperimentDefinition(
+        id: "dashboard_dynamic",
+        title: "Dashboard Dynamic Mode",
+        summary: "Runs the dashboard against the dynamic pipeline for live comparison.",
+        group: .dynamic,
+        workingDirectory: "{repo}/training",
+        buildCommand: nil,
+        runCommand: "uv run --with blessed --with psutil --with numpy python dashboard.py --dynamic",
+        telemetry: "dashboard stream + powermetrics",
+        sourcePath: "training/dashboard.py",
+        requiresSudo: true
+    ))
+    appendIfPresent("training/dashboard.py", experiment: ExperimentDefinition(
+        id: "dashboard_dynamic_no_generate",
+        title: "Dashboard Dynamic (No Generate)",
+        summary: "Dynamic dashboard without text sampling, useful for cleaner benchmark runs.",
+        group: .dynamic,
+        workingDirectory: "{repo}/training",
+        buildCommand: nil,
+        runCommand: "uv run --with blessed --with psutil --with numpy python dashboard.py --dynamic --no-generate",
+        telemetry: "dashboard stream + powermetrics",
+        sourcePath: "training/dashboard.py",
+        requiresSudo: true,
+        advanced: true
+    ))
+
+    let validationEntries: [(String, String, String)] = [
+        ("test_rmsnorm_bwd", "RMSNorm Backward Validation", "Validates the ANE RMSNorm backward path."),
+        ("test_classifier", "Classifier Validation", "Validates the ANE classifier path."),
+        ("test_weight_reload", "Weight Reload Probe", "Tests whether weights can change without recompilation."),
+        ("test_perf_stats", "Performance Stats Probe", "Checks the private perf-stats path on the current machine."),
+        ("test_qos_sweep", "QoS Sweep", "Sweeps QoS settings to measure compile/load/eval behavior."),
+        ("test_ane_advanced", "Advanced ANE Probe", "Explores private classes, weightsBuffer, and procedureIndex behavior."),
+    ]
+
+    for (id, title, summary) in validationEntries where has("training/\(id).m") {
+        experiments.append(
+            ExperimentDefinition(
+                id: id,
+                title: title,
+                summary: summary,
+                group: .validation,
+                workingDirectory: "{repo}",
+                buildCommand: "make -C training \(id)",
+                runCommand: "./training/\(id)",
+                telemetry: id == "test_qos_sweep" ? "stdout table" : "stdout summary",
+                sourcePath: "training/\(id).m",
+                advanced: id == "test_ane_advanced"
+            )
+        )
+    }
+
+    let sourceOnlyProbes: [(String, String, String)] = [
+        ("test_dynamic_matmul", "Dynamic Matmul Standalone", "Catalogued probe in source; build recipe still needs wiring."),
+        ("test_weight_patch", "Weight Patch Standalone", "Catalogued probe in source; build recipe still needs wiring."),
+        ("test_ane_causal_attn", "ANE Causal Attention", "Catalogued probe in source; build recipe still needs wiring."),
+        ("test_ane_sdpa5", "ANE SDPA", "Catalogued probe in source; build recipe still needs wiring."),
+        ("test_conv_attn3", "Conv Attention", "Catalogued probe in source; build recipe still needs wiring."),
+        ("test_full_fused", "Full Fused Probe", "Catalogued probe in source; build recipe still needs wiring."),
+        ("test_fused_bwd", "Fused Backward Probe", "Catalogued probe in source; build recipe still needs wiring."),
+        ("test_fused_qkv", "Fused QKV Probe", "Catalogued probe in source; build recipe still needs wiring."),
+    ]
+    for (id, title, summary) in sourceOnlyProbes where has("training/\(id).m") {
+        experiments.append(
+            ExperimentDefinition(
+                id: id,
+                title: title,
+                summary: summary,
+                group: .validation,
+                workingDirectory: "{repo}",
+                buildCommand: nil,
+                runCommand: nil,
+                telemetry: "catalogued only",
+                sourcePath: "training/\(id).m",
+                advanced: true
+            )
+        )
+    }
+
+    appendIfPresent("bridge/Makefile", experiment: ExperimentDefinition(
+        id: "bridge_build",
+        title: "Build Bridge dylib",
+        summary: "Builds the native bridge layer for future integrations and runtime work.",
+        group: .bridge,
+        workingDirectory: "{repo}",
+        buildCommand: "make -C bridge",
+        runCommand: nil,
+        telemetry: "build log",
+        sourcePath: "bridge/Makefile",
+        advanced: true
+    ))
+
+    if profile.kind == .labEnhanced, has("training/research/run_research.py") {
+        experiments.append(
+            ExperimentDefinition(
+                id: "lab_research",
+                title: "Lab Research Pipeline",
+                summary: "Runs the private research stack that generates charts, reports, and social assets.",
+                group: .lab,
+                workingDirectory: "{repo}",
+                buildCommand: "uv sync",
+                runCommand: "uv run python training/research/run_research.py --qos-runs 3",
+                telemetry: "artifact hydration + stdout summary",
+                sourcePath: "training/research/run_research.py"
+            )
+        )
+    }
+
+    return experiments.sorted { lhs, rhs in
+        if lhs.group == rhs.group {
+            if lhs.advanced == rhs.advanced {
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+            return lhs.advanced == false && rhs.advanced == true
+        }
+        return lhs.group.rawValue < rhs.group.rawValue
+    }
+}
+
 private func shellQuote(_ value: String) -> String {
     "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+private func defaultShellEnvironment() -> [String: String] {
+    var environment = ProcessInfo.processInfo.environment
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let preferredPathParts = [
+        "\(home)/.local/bin",
+        "\(home)/.cargo/bin",
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    let existingParts = (environment["PATH"] ?? "")
+        .split(separator: ":")
+        .map(String.init)
+    var mergedPath = preferredPathParts
+    for part in existingParts where !mergedPath.contains(part) {
+        mergedPath.append(part)
+    }
+    environment["PATH"] = mergedPath.joined(separator: ":")
+    return environment
+}
+
+private func cleanShellOutput(_ text: String) -> String {
+    let noisePatterns = [
+        ".bash_profile: line",
+        "cargo/env: No such file or directory",
+    ]
+    let lines = text
+        .split(whereSeparator: \.isNewline)
+        .map(String.init)
+        .filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                return false
+            }
+            return !noisePatterns.contains(where: { trimmed.contains($0) })
+        }
+    return lines.joined(separator: "\n")
 }
 
 private func runShellCommand(_ command: String) -> (status: Int32, output: String) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
-    process.arguments = ["-lc", command]
+    process.arguments = ["-c", command]
+    process.environment = defaultShellEnvironment()
 
     let outputPipe = Pipe()
     process.standardOutput = outputPipe
@@ -305,7 +730,8 @@ private func runShellCommand(_ command: String) -> (status: Int32, output: Strin
 
     process.waitUntilExit()
     let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-    let text = String(data: data, encoding: .utf8) ?? ""
+    let rawText = String(data: data, encoding: .utf8) ?? ""
+    let text = cleanShellOutput(rawText)
     return (status: process.terminationStatus, output: text)
 }
 
@@ -316,7 +742,12 @@ private func readGitHeadInfo(in repoRoot: String) -> GitHeadInfo? {
     guard result.status == 0 else {
         return nil
     }
-    let line = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    let line = result.output
+        .split(whereSeparator: \.isNewline)
+        .map(String.init)
+        .reversed()
+        .first(where: { $0.contains("|") })?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let components = line.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
     guard components.count == 3,
           let epoch = TimeInterval(components[1])
@@ -347,7 +778,11 @@ private func readGitAheadBehind(in repoRoot: String) -> (ahead: Int, behind: Int
     guard result.status == 0 else {
         return nil
     }
-    let tokens = result.output
+    let line = result.output
+        .split(whereSeparator: \.isNewline)
+        .map(String.init)
+        .last ?? result.output
+    let tokens = line
         .split(whereSeparator: \.isWhitespace)
         .map(String.init)
     guard tokens.count >= 2,
@@ -545,6 +980,104 @@ private func modelHealthSummary(catalog: ModelCatalog, repoRoot: String) -> Mode
     )
 }
 
+private struct InferenceRuntimeCandidate {
+    var label: String
+    var commandTemplate: String
+}
+
+private func discoverInferenceRuntimeCandidates(in repoRoot: String) -> [InferenceRuntimeCandidate] {
+    let fileManager = FileManager.default
+    let rootURL = URL(fileURLWithPath: repoRoot, isDirectory: true)
+    let trainingURL = rootURL.appendingPathComponent("training", isDirectory: true)
+    var candidates: [InferenceRuntimeCandidate] = []
+    var seenTemplates: Set<String> = []
+
+    func appendCandidate(label: String, template: String) {
+        guard !template.isEmpty, !seenTemplates.contains(template) else {
+            return
+        }
+        seenTemplates.insert(template)
+        candidates.append(InferenceRuntimeCandidate(label: label, commandTemplate: template))
+    }
+
+    let knownPaths = [
+        "training/inference/chat.py",
+        "training/inference.py",
+        "training/chat.py",
+        "inference/chat.py",
+        "inference/run_chat.py",
+    ]
+    for path in knownPaths where fileManager.fileExists(atPath: rootURL.appendingPathComponent(path).path) {
+        appendCandidate(
+            label: path,
+            template: "uv run python \(path) --model {model} --prompt {prompt} --stream"
+        )
+    }
+
+    guard fileManager.fileExists(atPath: trainingURL.path),
+          let enumerator = fileManager.enumerator(
+            at: trainingURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+          )
+    else {
+        return candidates
+    }
+
+    let triggerTokens = ["infer", "inference", "chat", "generate", "qwen", "llm"]
+
+    while let fileURL = enumerator.nextObject() as? URL {
+        guard ["py", "sh"].contains(fileURL.pathExtension.lowercased()) else {
+            continue
+        }
+        let relPath = fileURL.path.replacingOccurrences(of: rootURL.path + "/", with: "")
+        let lowerName = fileURL.lastPathComponent.lowercased()
+        guard triggerTokens.contains(where: { lowerName.contains($0) }) else {
+            continue
+        }
+
+        let text = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+        let lowerText = text.lowercased()
+        let hasPrompt = lowerText.contains("--prompt") || lowerText.contains("prompt")
+        guard hasPrompt else {
+            continue
+        }
+
+        let hasModel = lowerText.contains("--model")
+        let hasRepo = lowerText.contains("--repo")
+        let hasStream = lowerText.contains("--stream")
+        let hasPromptFlag = lowerText.contains("--prompt")
+
+        var command: String
+        if fileURL.pathExtension.lowercased() == "py" {
+            command = "uv run python \(relPath)"
+        } else {
+            command = "bash \(relPath)"
+        }
+
+        if hasModel {
+            command += " --model {model}"
+        }
+        if hasRepo {
+            command += " --repo {repo}"
+        }
+        if hasPromptFlag {
+            command += " --prompt {prompt}"
+        } else {
+            command += " {prompt}"
+        }
+        if hasStream {
+            command += " --stream"
+        }
+
+        appendCandidate(label: relPath, template: command)
+    }
+
+    return candidates.sorted { lhs, rhs in
+        lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+    }
+}
+
 private func formatBytes(_ bytes: UInt64) -> String {
     let formatter = ByteCountFormatter()
     formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
@@ -560,6 +1093,23 @@ private func truncate(_ text: String, maxLength: Int) -> String {
     }
     let end = text.index(text.startIndex, offsetBy: max(0, maxLength - 1))
     return String(text[..<end]) + "…"
+}
+
+private func abbreviatedPath(_ path: String, maxLength: Int = 48) -> String {
+    let expanded = NSString(string: path).abbreviatingWithTildeInPath
+    guard expanded.count > maxLength else {
+        return expanded
+    }
+
+    let components = expanded.split(separator: "/").map(String.init)
+    guard components.count >= 3 else {
+        return truncate(expanded, maxLength: maxLength)
+    }
+
+    let tail = components.suffix(3).joined(separator: "/")
+    let prefix = expanded.hasPrefix("/") ? "/" : ""
+    let compact = "\(prefix)…/\(tail)"
+    return truncate(compact, maxLength: maxLength)
 }
 
 private func formatDuration(_ seconds: Double) -> String {
@@ -659,23 +1209,713 @@ private func parseResearchSummary(in repoRoot: String) -> ResearchSummarySnapsho
 }
 
 @MainActor
+private final class ExperimentActionButton: NSButton {
+    var experimentID: String = ""
+}
+
+@MainActor
+private final class TelemetryWindowController: NSWindowController {
+    private let metricsView = LiveMetricsMenuView(frame: NSRect(x: 0, y: 0, width: 860, height: 520))
+    private let headlineLabel = NSTextField(labelWithString: "ANEBar Telemetry")
+    private let detailLabel = NSTextField(labelWithString: "Waiting for metrics…")
+
+    override init(window: NSWindow?) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 640),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "ANEBar Telemetry"
+        window.minSize = NSSize(width: 720, height: 520)
+        super.init(window: window)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    func push(sample: LiveMetricsSample) {
+        metricsView.push(sample)
+    }
+
+    func updateContext(repoProfile: RepoProfile, repoRoot: String, currentRunTitle: String?, telemetrySource: String?) {
+        headlineLabel.stringValue = currentRunTitle.map { "ANEBar Telemetry | \($0)" } ?? "ANEBar Telemetry"
+        detailLabel.stringValue = "Profile \(repoProfile.label) | \(telemetrySource ?? "idle") | \(abbreviatedPath(repoRoot, maxLength: 72))"
+    }
+
+    private func setupUI() {
+        guard let contentView = window?.contentView else {
+            return
+        }
+
+        headlineLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        detailLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        detailLabel.textColor = .secondaryLabelColor
+
+        metricsView.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [headlineLabel, detailLabel, metricsView])
+        stack.orientation = .vertical
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -16),
+            metricsView.heightAnchor.constraint(greaterThanOrEqualToConstant: 500),
+        ])
+    }
+}
+
+@MainActor
+private final class ExperimentConsoleWindowController: NSWindowController {
+    private let summaryLabel = NSTextField(labelWithString: "ANE experiments")
+    private let detailLabel = NSTextField(labelWithString: "")
+    private let scrollView = NSScrollView()
+    private let contentStack = NSStackView()
+    private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
+    private let searchField = NSSearchField(frame: .zero)
+    private let groupPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+
+    private var allExperiments: [ExperimentDefinition] = []
+    private var experimentsByID: [String: ExperimentDefinition] = [:]
+    private var runButtons: [ExperimentActionButton] = []
+    private var queueButtons: [ExperimentActionButton] = []
+    private var isBusy: Bool = false
+
+    var onRunExperiment: ((ExperimentDefinition) -> Void)?
+    var onQueueExperiment: ((ExperimentDefinition) -> Void)?
+    var onCopyExperimentCommand: ((ExperimentDefinition) -> String?)?
+    var onRefresh: (() -> Void)?
+
+    override init(window: NSWindow?) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 620),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "ANEBar Experiment Console"
+        window.minSize = NSSize(width: 640, height: 520)
+        super.init(window: window)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    func update(profile: RepoProfile, experiments: [ExperimentDefinition]) {
+        allExperiments = experiments
+        experimentsByID = Dictionary(uniqueKeysWithValues: experiments.map { ($0.id, $0) })
+        let runnableCount = experiments.filter(\.isRunnable).count
+        summaryLabel.stringValue = "\(profile.label) | \(runnableCount) runnable / \(experiments.count) catalogued"
+        detailLabel.stringValue = profile.detail
+        rebuildContent(experiments: filteredExperiments())
+    }
+
+    func setBusy(_ busy: Bool) {
+        isBusy = busy
+        for button in runButtons {
+            let runnable = experimentsByID[button.experimentID]?.isRunnable == true
+            button.isEnabled = !busy && runnable
+        }
+        for button in queueButtons {
+            let runnable = experimentsByID[button.experimentID]?.isRunnable == true
+            button.isEnabled = !busy && runnable
+        }
+    }
+
+    private func setupUI() {
+        guard let contentView = window?.contentView else {
+            return
+        }
+
+        summaryLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        detailLabel.font = .systemFont(ofSize: 12)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.lineBreakMode = .byWordWrapping
+        detailLabel.maximumNumberOfLines = 2
+
+        searchField.placeholderString = "Search experiments"
+        searchField.target = self
+        searchField.action = #selector(filterChanged)
+
+        groupPopup.addItems(withTitles: ["All"] + ExperimentGroup.allCases.map(\.rawValue))
+        groupPopup.target = self
+        groupPopup.action = #selector(filterChanged)
+
+        refreshButton.target = self
+        refreshButton.action = #selector(refreshPressed)
+
+        let headerStack = NSStackView(views: [summaryLabel, NSView(), refreshButton])
+        headerStack.orientation = .horizontal
+        headerStack.alignment = .centerY
+        headerStack.spacing = 10
+
+        let filterStack = NSStackView(views: [searchField, groupPopup])
+        filterStack.orientation = .horizontal
+        filterStack.alignment = .centerY
+        filterStack.spacing = 10
+        searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        searchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        contentStack.orientation = .vertical
+        contentStack.spacing = 12
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let documentView = NSView()
+        documentView.translatesAutoresizingMaskIntoConstraints = false
+        documentView.addSubview(contentStack)
+
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.documentView = documentView
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            contentStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            contentStack.topAnchor.constraint(equalTo: documentView.topAnchor),
+            contentStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
+            contentStack.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+        ])
+
+        let root = NSStackView(views: [headerStack, detailLabel, filterStack, scrollView])
+        root.orientation = .vertical
+        root.spacing = 10
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        contentView.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
+            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -16),
+        ])
+    }
+
+    private func rebuildContent(experiments: [ExperimentDefinition]) {
+        runButtons = []
+        queueButtons = []
+        for view in contentStack.arrangedSubviews {
+            contentStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        if experiments.isEmpty {
+            let empty = NSTextField(labelWithString: "No experiments match the current filters.")
+            empty.textColor = .secondaryLabelColor
+            contentStack.addArrangedSubview(empty)
+            return
+        }
+
+        let grouped = Dictionary(grouping: experiments) { $0.group }
+        for group in ExperimentGroup.allCases {
+            guard let groupExperiments = grouped[group], !groupExperiments.isEmpty else {
+                continue
+            }
+
+            let header = NSTextField(labelWithString: group.rawValue)
+            header.font = .systemFont(ofSize: 14, weight: .semibold)
+            header.textColor = .labelColor
+            contentStack.addArrangedSubview(header)
+
+            for experiment in groupExperiments {
+                contentStack.addArrangedSubview(makeCard(for: experiment))
+            }
+        }
+        setBusy(isBusy)
+    }
+
+    private func makeCard(for experiment: ExperimentDefinition) -> NSView {
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 12
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.42).cgColor
+
+        let titleLabel = NSTextField(labelWithString: experiment.title)
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+
+        let summaryLabel = NSTextField(wrappingLabelWithString: experiment.summary)
+        summaryLabel.font = .systemFont(ofSize: 12)
+        summaryLabel.textColor = .secondaryLabelColor
+
+        let metaLabel = NSTextField(labelWithString: experiment.metadataLine)
+        metaLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        metaLabel.textColor = .tertiaryLabelColor
+
+        let runButton = ExperimentActionButton(title: experiment.isRunnable ? "Run" : "Catalogued", target: self, action: #selector(runPressed(_:)))
+        runButton.experimentID = experiment.id
+        runButton.isEnabled = experiment.isRunnable
+        runButtons.append(runButton)
+
+        let copyButton = ExperimentActionButton(title: experiment.isRunnable ? "Copy Command" : "Copy Source Path", target: self, action: #selector(copyPressed(_:)))
+        copyButton.experimentID = experiment.id
+
+        let queueButton = ExperimentActionButton(title: "Queue", target: self, action: #selector(queuePressed(_:)))
+        queueButton.experimentID = experiment.id
+        queueButton.isEnabled = experiment.isRunnable
+        queueButtons.append(queueButton)
+
+        let buttonStack = NSStackView(views: [runButton, queueButton, copyButton])
+        buttonStack.orientation = .horizontal
+        buttonStack.spacing = 8
+
+        let root = NSStackView(views: [titleLabel, summaryLabel, metaLabel, buttonStack])
+        root.orientation = .vertical
+        root.spacing = 6
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            root.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            root.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            root.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
+        ])
+
+        return card
+    }
+
+    @objc private func refreshPressed() {
+        onRefresh?()
+    }
+
+    @objc private func filterChanged() {
+        rebuildContent(experiments: filteredExperiments())
+    }
+
+    @objc private func runPressed(_ sender: ExperimentActionButton) {
+        guard let experiment = experimentsByID[sender.experimentID] else {
+            return
+        }
+        onRunExperiment?(experiment)
+    }
+
+    @objc private func queuePressed(_ sender: ExperimentActionButton) {
+        guard let experiment = experimentsByID[sender.experimentID] else {
+            return
+        }
+        onQueueExperiment?(experiment)
+    }
+
+    @objc private func copyPressed(_ sender: ExperimentActionButton) {
+        guard let experiment = experimentsByID[sender.experimentID] else {
+            return
+        }
+        let text = onCopyExperimentCommand?(experiment) ?? experiment.sourcePath ?? experiment.id
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        detailLabel.stringValue = "Copied: \(text)"
+    }
+
+    private func filteredExperiments() -> [ExperimentDefinition] {
+        let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let selectedGroup = groupPopup.titleOfSelectedItem ?? "All"
+
+        return allExperiments.filter { experiment in
+            let matchesGroup = selectedGroup == "All" || experiment.group.rawValue == selectedGroup
+            let haystack = [
+                experiment.id,
+                experiment.title,
+                experiment.summary,
+                experiment.sourcePath ?? "",
+                experiment.telemetry,
+            ]
+            .joined(separator: " ")
+            .lowercased()
+            let matchesQuery = query.isEmpty || haystack.contains(query)
+            return matchesGroup && matchesQuery
+        }
+    }
+}
+
+@MainActor
+private final class HistoryWindowController: NSWindowController {
+    private let summaryLabel = NSTextField(labelWithString: "ANEBar History")
+    private let detailLabel = NSTextField(labelWithString: "Recent runs and side-by-side comparison.")
+    private let primaryPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let comparePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let rerunButton = NSButton(title: "Re-run", target: nil, action: nil)
+    private let copyCommandButton = NSButton(title: "Copy Command", target: nil, action: nil)
+    private let exportReproButton = NSButton(title: "Export Repro", target: nil, action: nil)
+    private let openSummaryButton = NSButton(title: "Open Summary", target: nil, action: nil)
+    private let openJSONButton = NSButton(title: "Open JSON", target: nil, action: nil)
+    private let copySocialButton = NSButton(title: "Copy Social Snippet", target: nil, action: nil)
+    private let outputTextView = NSTextView(frame: .zero)
+
+    private var records: [RunRecord] = []
+    private var primaryIDs: [String] = []
+    private var compareIDs: [String?] = []
+    private var currentRepoRoot: String = ""
+    private var isBusy: Bool = false
+
+    var onRerun: ((RunRecord) -> Void)?
+    var onCopyCommand: ((RunRecord) -> String?)?
+    var onExportRepro: (() -> Void)?
+    var onOpenSummary: (() -> Void)?
+    var onOpenHistoryJSON: (() -> Void)?
+    var onCopySocialSnippet: ((RunRecord, RunRecord?) -> String?)?
+
+    override init(window: NSWindow?) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 880, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "ANEBar History"
+        window.minSize = NSSize(width: 760, height: 560)
+        super.init(window: window)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    func update(records: [RunRecord], repoRoot: String) {
+        self.records = records.sorted { $0.endedAt > $1.endedAt }
+        currentRepoRoot = repoRoot
+        summaryLabel.stringValue = "ANEBar History | \(self.records.count) runs"
+        detailLabel.stringValue = abbreviatedPath(repoRoot, maxLength: 84)
+        rebuildSelectors()
+    }
+
+    func setBusy(_ busy: Bool) {
+        isBusy = busy
+        rerunButton.isEnabled = !busy && selectedPrimaryRecord() != nil
+        copyCommandButton.isEnabled = selectedPrimaryRecord() != nil
+        exportReproButton.isEnabled = !records.isEmpty
+        openSummaryButton.isEnabled = !records.isEmpty
+        openJSONButton.isEnabled = !records.isEmpty
+        copySocialButton.isEnabled = selectedPrimaryRecord() != nil
+    }
+
+    private func setupUI() {
+        guard let contentView = window?.contentView else {
+            return
+        }
+
+        summaryLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+        detailLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        detailLabel.textColor = .secondaryLabelColor
+
+        primaryPopup.target = self
+        primaryPopup.action = #selector(selectionChanged)
+        comparePopup.target = self
+        comparePopup.action = #selector(selectionChanged)
+
+        rerunButton.target = self
+        rerunButton.action = #selector(rerunPressed)
+        copyCommandButton.target = self
+        copyCommandButton.action = #selector(copyCommandPressed)
+        exportReproButton.target = self
+        exportReproButton.action = #selector(exportReproPressed)
+        openSummaryButton.target = self
+        openSummaryButton.action = #selector(openSummaryPressed)
+        openJSONButton.target = self
+        openJSONButton.action = #selector(openJSONPressed)
+        copySocialButton.target = self
+        copySocialButton.action = #selector(copySocialPressed)
+
+        outputTextView.isEditable = false
+        outputTextView.isSelectable = true
+        outputTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        outputTextView.backgroundColor = .clear
+        outputTextView.textColor = .labelColor
+
+        let outputScrollView = NSScrollView()
+        outputScrollView.drawsBackground = false
+        outputScrollView.hasVerticalScroller = true
+        outputScrollView.borderType = .noBorder
+        outputScrollView.documentView = outputTextView
+        outputScrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        let runRow = NSStackView(views: [
+            NSTextField(labelWithString: "Run"),
+            primaryPopup,
+            NSTextField(labelWithString: "Compare"),
+            comparePopup,
+        ])
+        runRow.orientation = .horizontal
+        runRow.alignment = .centerY
+        runRow.spacing = 10
+        primaryPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        comparePopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let actions = NSStackView(views: [
+            rerunButton,
+            copyCommandButton,
+            exportReproButton,
+            openSummaryButton,
+            openJSONButton,
+            copySocialButton,
+        ])
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 8
+        actions.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+
+        let root = NSStackView(views: [summaryLabel, detailLabel, runRow, actions, outputScrollView])
+        root.orientation = .vertical
+        root.spacing = 12
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        contentView.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
+            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -16),
+            outputScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 360),
+        ])
+    }
+
+    private func rebuildSelectors() {
+        let previousPrimary = selectedPrimaryRecord()?.id
+        let previousCompare = selectedCompareRecord()?.id
+
+        primaryPopup.removeAllItems()
+        comparePopup.removeAllItems()
+        primaryIDs = []
+        compareIDs = []
+
+        if records.isEmpty {
+            primaryPopup.addItem(withTitle: "No runs yet")
+            comparePopup.addItem(withTitle: "No compare")
+            outputTextView.string = "Run an experiment to populate history."
+            setBusy(isBusy)
+            return
+        }
+
+        for record in records {
+            primaryPopup.addItem(withTitle: label(for: record))
+            primaryIDs.append(record.id)
+        }
+
+        comparePopup.addItem(withTitle: "No compare")
+        compareIDs.append(nil)
+        for record in records {
+            comparePopup.addItem(withTitle: label(for: record))
+            compareIDs.append(record.id)
+        }
+
+        if let previousPrimary, let index = primaryIDs.firstIndex(of: previousPrimary) {
+            primaryPopup.selectItem(at: index)
+        } else {
+            primaryPopup.selectItem(at: 0)
+        }
+
+        if let previousCompare, let index = compareIDs.firstIndex(of: previousCompare) {
+            comparePopup.selectItem(at: index)
+        } else {
+            comparePopup.selectItem(at: min(2, comparePopup.numberOfItems - 1))
+        }
+
+        if selectedCompareRecord()?.id == selectedPrimaryRecord()?.id {
+            comparePopup.selectItem(at: 0)
+        }
+
+        refreshDetail()
+    }
+
+    private func selectedPrimaryRecord() -> RunRecord? {
+        let index = primaryPopup.indexOfSelectedItem
+        guard index >= 0, index < primaryIDs.count else {
+            return nil
+        }
+        return records.first { $0.id == primaryIDs[index] }
+    }
+
+    private func selectedCompareRecord() -> RunRecord? {
+        let index = comparePopup.indexOfSelectedItem
+        guard index >= 0, index < compareIDs.count, let id = compareIDs[index] else {
+            return nil
+        }
+        return records.first { $0.id == id }
+    }
+
+    private func label(for record: RunRecord) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        let relative = formatter.localizedString(for: record.endedAt, relativeTo: Date())
+        let outcome = record.exitCode == 0 ? "ok" : "fail \(record.exitCode)"
+        return "\(record.title ?? record.mode) | \(outcome) | \(relative)"
+    }
+
+    private func refreshDetail() {
+        guard let primary = selectedPrimaryRecord() else {
+            outputTextView.string = "Run an experiment to populate history."
+            setBusy(isBusy)
+            return
+        }
+
+        let compare = selectedCompareRecord()?.id == primary.id ? nil : selectedCompareRecord()
+        outputTextView.string = detailString(for: primary, comparedTo: compare)
+        setBusy(isBusy)
+    }
+
+    private func detailString(for primary: RunRecord, comparedTo compare: RunRecord?) -> String {
+        var lines: [String] = []
+        lines.append("# Selected Run")
+        lines.append("")
+        lines.append("- Title: \(primary.title ?? primary.mode)")
+        lines.append("- Ended: \(ISO8601DateFormatter().string(from: primary.endedAt))")
+        lines.append("- Duration: \(formatDuration(primary.durationSeconds))")
+        lines.append("- Exit: \(primary.exitCode)")
+        lines.append("- Telemetry: \(primary.telemetrySource ?? "n/a")")
+        lines.append("- Group: \(primary.group ?? "n/a")")
+        lines.append("- Repo head: \(primary.repoHead ?? "unknown")")
+        lines.append("- Repo root: \(primary.repoRoot)")
+        lines.append("- Working dir: \(primary.workingDirectory ?? primary.repoRoot)")
+        lines.append("- Command: \(primary.command)")
+        lines.append("")
+        lines.append("# Metrics")
+        lines.append(metricLine(prefix: "ANE TFLOPS", value: primary.aneTFLOPS, format: "%.2f"))
+        lines.append(metricLine(prefix: "ANE util", value: primary.aneUtilization, format: "%.2f%%"))
+        lines.append(metricLine(prefix: "Avg train", value: primary.avgTrainMS, format: "%.2f ms"))
+        lines.append(metricLine(prefix: "Total TFLOPS", value: primary.totalTFLOPS, format: "%.2f"))
+
+        if let compare {
+            lines.append("")
+            lines.append("# Compare")
+            lines.append("")
+            lines.append("- Against: \(compare.title ?? compare.mode)")
+            let deltas = comparisonLines(current: primary, previous: compare)
+            if deltas.isEmpty {
+                lines.append("- Deltas: n/a")
+            } else {
+                for delta in deltas {
+                    lines.append("- \(delta)")
+                }
+            }
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func metricLine(prefix: String, value: Double?, format: String) -> String {
+        guard let value else {
+            return "- \(prefix): n/a"
+        }
+        return "- \(prefix): " + String(format: format, value)
+    }
+
+    private func comparisonLines(current: RunRecord, previous: RunRecord) -> [String] {
+        var lines: [String] = []
+        if let currentValue = current.aneTFLOPS, let previousValue = previous.aneTFLOPS {
+            lines.append("ANE TFLOPS " + formatSigned(currentValue - previousValue, suffix: ""))
+        }
+        if let currentValue = current.aneUtilization, let previousValue = previous.aneUtilization {
+            lines.append("ANE util " + formatSigned(currentValue - previousValue, suffix: "%"))
+        }
+        if let currentValue = current.avgTrainMS, let previousValue = previous.avgTrainMS {
+            lines.append("Avg train " + formatSigned(currentValue - previousValue, suffix: "ms"))
+        }
+        lines.append("Duration " + formatSigned(current.durationSeconds - previous.durationSeconds, suffix: "s"))
+        return lines
+    }
+
+    @objc private func selectionChanged() {
+        refreshDetail()
+    }
+
+    @objc private func rerunPressed() {
+        guard let primary = selectedPrimaryRecord() else {
+            return
+        }
+        onRerun?(primary)
+    }
+
+    @objc private func copyCommandPressed() {
+        guard let primary = selectedPrimaryRecord() else {
+            return
+        }
+        let text = onCopyCommand?(primary) ?? primary.command
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        detailLabel.stringValue = "Copied command for \(primary.title ?? primary.mode)"
+    }
+
+    @objc private func exportReproPressed() {
+        onExportRepro?()
+    }
+
+    @objc private func openSummaryPressed() {
+        onOpenSummary?()
+    }
+
+    @objc private func openJSONPressed() {
+        onOpenHistoryJSON?()
+    }
+
+    @objc private func copySocialPressed() {
+        guard let primary = selectedPrimaryRecord() else {
+            return
+        }
+        let compare = selectedCompareRecord()?.id == primary.id ? nil : selectedCompareRecord()
+        let text = onCopySocialSnippet?(primary, compare) ?? socialSnippet(for: primary, comparedTo: compare)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        detailLabel.stringValue = "Copied social snippet for \(primary.title ?? primary.mode)"
+    }
+
+    private func socialSnippet(for primary: RunRecord, comparedTo compare: RunRecord?) -> String {
+        var parts: [String] = []
+        parts.append("\(primary.title ?? primary.mode) on Apple Silicon")
+        if let tflops = primary.aneTFLOPS {
+            parts.append(String(format: "ANE %.2f TFLOPS", tflops))
+        }
+        if let util = primary.aneUtilization {
+            parts.append(String(format: "util %.1f%%", util))
+        }
+        if let avg = primary.avgTrainMS {
+            parts.append(String(format: "avg %.1f ms", avg))
+        }
+        if let compare,
+           let current = primary.aneTFLOPS,
+           let previous = compare.aneTFLOPS
+        {
+            parts.append("vs prev " + formatSigned(current - previous, suffix: " TFLOPS"))
+        }
+        return parts.joined(separator: " | ")
+    }
+}
+
+@MainActor
 private final class ChatWindowController: NSWindowController {
     private enum DefaultsKey {
         static let chatModel = "anebar_chat_model"
+        static let chatRuntimeTemplate = "anebar_chat_runtime_template"
     }
 
     private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let runtimeField = NSTextField()
     private let promptField = NSTextField()
     private let sendButton = NSButton(title: "Send", target: nil, action: nil)
     private let stopButton = NSButton(title: "Stop", target: nil, action: nil)
     private let refreshButton = NSButton(title: "Refresh Models", target: nil, action: nil)
-    private let pullSmallModelButton = NSButton(title: "Pull qwen2.5:0.5b", target: nil, action: nil)
+    private let detectRuntimeButton = NSButton(title: "Detect ANE Runtime", target: nil, action: nil)
     private let clearButton = NSButton(title: "Clear", target: nil, action: nil)
-    private let statusLabel = NSTextField(labelWithString: "Local chat ready")
+    private let statusLabel = NSTextField(labelWithString: "ANE chat ready")
     private let outputTextView = NSTextView(frame: .zero)
 
     private var chatProcess: Process?
+    private var repoRoot: String = ""
     private var fallbackModels: [String] = []
+    private var runtimeCandidates: [InferenceRuntimeCandidate] = []
     private var streamStartedAt: Date?
     private var streamTokenApproxCount: Int = 0
 
@@ -687,11 +1927,11 @@ private final class ChatWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.title = "ANEbar Local Chat"
+        window.title = "ANEbar ANE Chat"
         window.minSize = NSSize(width: 560, height: 420)
         super.init(window: window)
         setupUI()
-        reloadModels(preserveSelection: true)
+        bootstrapRuntimeTemplateIfNeeded()
     }
 
     required init?(coder: NSCoder) {
@@ -700,9 +1940,13 @@ private final class ChatWindowController: NSWindowController {
 
     func setFallbackModels(_ models: [String]) {
         fallbackModels = Array(Set(models)).sorted()
-        if modelPopup.numberOfItems == 0 {
-            reloadModels(preserveSelection: true)
-        }
+        reloadModels(preserveSelection: true)
+    }
+
+    func setRepoRoot(_ path: String) {
+        repoRoot = path
+        refreshRuntimeCandidates()
+        reloadModels(preserveSelection: true)
     }
 
     private func setupUI() {
@@ -710,8 +1954,15 @@ private final class ChatWindowController: NSWindowController {
             return
         }
 
-        let titleLabel = NSTextField(labelWithString: "Model")
-        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        let runtimeLabel = NSTextField(labelWithString: "ANE Runtime")
+        runtimeLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        runtimeField.placeholderString = "uv run python training/inference/chat.py --model {model} --prompt {prompt} --stream"
+        runtimeField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        runtimeField.target = self
+        runtimeField.action = #selector(saveRuntimeTemplate)
+
+        let modelLabel = NSTextField(labelWithString: "Model")
+        modelLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         modelPopup.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
 
         promptField.placeholderString = "Prompt (press Enter or click Send)"
@@ -730,8 +1981,8 @@ private final class ChatWindowController: NSWindowController {
         refreshButton.target = self
         refreshButton.action = #selector(refreshModels)
 
-        pullSmallModelButton.target = self
-        pullSmallModelButton.action = #selector(pullSmallModel)
+        detectRuntimeButton.target = self
+        detectRuntimeButton.action = #selector(detectRuntimeNow)
 
         clearButton.target = self
         clearButton.action = #selector(clearOutput)
@@ -743,7 +1994,7 @@ private final class ChatWindowController: NSWindowController {
         outputTextView.isSelectable = true
         outputTextView.isRichText = false
         outputTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        outputTextView.string = "ANEbar local chat. Select a small model and start chatting.\n"
+        outputTextView.string = "ANEbar ANE chat. Configure ANE runtime template and start chatting.\n"
         outputTextView.textColor = .labelColor
         outputTextView.backgroundColor = .textBackgroundColor
 
@@ -752,9 +2003,15 @@ private final class ChatWindowController: NSWindowController {
         scrollView.drawsBackground = true
         scrollView.documentView = outputTextView
 
-        let controlsStack = NSStackView(views: [
-            titleLabel, modelPopup, refreshButton, pullSmallModelButton, stopButton, clearButton,
-        ])
+        let runtimeStack = NSStackView(views: [runtimeLabel, runtimeField, detectRuntimeButton])
+        runtimeStack.orientation = .horizontal
+        runtimeStack.spacing = 10
+        runtimeStack.alignment = .centerY
+        runtimeStack.distribution = .gravityAreas
+        runtimeField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        runtimeField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let controlsStack = NSStackView(views: [modelLabel, modelPopup, refreshButton, stopButton, clearButton])
         controlsStack.orientation = .horizontal
         controlsStack.spacing = 10
         controlsStack.alignment = .centerY
@@ -767,7 +2024,7 @@ private final class ChatWindowController: NSWindowController {
         promptStack.spacing = 10
         promptStack.alignment = .centerY
 
-        let root = NSStackView(views: [controlsStack, promptStack, scrollView, statusLabel])
+        let root = NSStackView(views: [runtimeStack, controlsStack, promptStack, scrollView, statusLabel])
         root.orientation = .vertical
         root.spacing = 10
         root.translatesAutoresizingMaskIntoConstraints = false
@@ -783,42 +2040,68 @@ private final class ChatWindowController: NSWindowController {
         ])
     }
 
-    private func discoverOllamaModels() -> [String] {
-        let result = runShellCommand("ollama list")
-        guard result.status == 0 else {
+    private func bootstrapRuntimeTemplateIfNeeded() {
+        if let saved = UserDefaults.standard.string(forKey: DefaultsKey.chatRuntimeTemplate),
+           !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            runtimeField.stringValue = saved
+            return
+        }
+        runtimeField.stringValue = "uv run python training/inference/chat.py --model {model} --prompt {prompt} --stream"
+    }
+
+    private func discoverRepoModels() -> [String] {
+        guard !repoRoot.isEmpty else {
             return []
         }
-        let rows = result.output
-            .split(whereSeparator: \.isNewline)
-            .map(String.init)
-            .dropFirst()
-        var models: [String] = []
-        for row in rows {
-            let trimmed = row.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty {
-                continue
-            }
-            let parts = trimmed.split(whereSeparator: \.isWhitespace)
-            if let first = parts.first {
-                models.append(String(first))
-            }
+
+        let catalog = discoverModelCatalog(in: repoRoot)
+        var names = catalog.artifacts.map {
+            URL(fileURLWithPath: $0.relativePath).deletingPathExtension().lastPathComponent
         }
-        return Array(Set(models)).sorted()
+
+        // Keep model list readable and useful for small LLM demos.
+        names = names
+            .filter { !$0.isEmpty && $0.count >= 3 }
+            .map { $0.replacingOccurrences(of: "_", with: "-") }
+        return Array(Set(names)).sorted()
     }
 
     @objc private func refreshModels() {
         reloadModels(preserveSelection: true)
     }
 
+    @objc private func saveRuntimeTemplate() {
+        let template = runtimeField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(template, forKey: DefaultsKey.chatRuntimeTemplate)
+    }
+
+    @objc private func detectRuntimeNow() {
+        refreshRuntimeCandidates()
+    }
+
+    private func refreshRuntimeCandidates() {
+        runtimeCandidates = discoverInferenceRuntimeCandidates(in: repoRoot)
+        if runtimeCandidates.isEmpty {
+            statusLabel.stringValue = "No ANE inference script detected. Set runtime template manually."
+            return
+        }
+
+        let picked = runtimeCandidates[0]
+        runtimeField.stringValue = picked.commandTemplate
+        UserDefaults.standard.set(picked.commandTemplate, forKey: DefaultsKey.chatRuntimeTemplate)
+        statusLabel.stringValue = "Detected runtime: \(picked.label)"
+    }
+
     private func reloadModels(preserveSelection: Bool) {
         let previous = preserveSelection ? modelPopup.titleOfSelectedItem : nil
-        let discovered = discoverOllamaModels()
-        let defaults = ["qwen2.5:0.5b", "qwen2.5:1.5b", "phi3:mini", "llama3.2:1b"]
-        let merged = discovered.isEmpty ? Array(Set(defaults + fallbackModels)).sorted() : discovered
+        let discovered = discoverRepoModels()
+        let defaults = ["Qwen3.5-0.8B", "TinyLlama-1.1B-Chat-v1.0", "Qwen2.5-0.5B-Instruct"]
+        let merged = Array(Set(defaults + fallbackModels + discovered)).sorted()
 
         modelPopup.removeAllItems()
         if merged.isEmpty {
-            statusLabel.stringValue = "No models discovered. Install Ollama and pull a small model."
+            statusLabel.stringValue = "No local model artifacts found in repo."
             return
         }
         modelPopup.addItems(withTitles: merged)
@@ -831,34 +2114,15 @@ private final class ChatWindowController: NSWindowController {
             modelPopup.selectItem(withTitle: first)
         }
 
-        if discovered.isEmpty {
-            statusLabel.stringValue = "No local Ollama model found. Pull one (e.g. ollama pull qwen2.5:0.5b)."
+        if discovered.isEmpty, !repoRoot.isEmpty {
+            statusLabel.stringValue = "Using fallback models. Add model artifacts to \(abbreviatedPath(repoRoot))."
         } else {
-            statusLabel.stringValue = "Ready. Streaming from local Ollama runtime."
+            statusLabel.stringValue = "Ready. Streaming from ANE runtime."
         }
     }
 
     @objc private func clearOutput() {
         outputTextView.string = ""
-    }
-
-    @objc private func pullSmallModel() {
-        guard chatProcess == nil else {
-            statusLabel.stringValue = "Stop current chat before pulling."
-            return
-        }
-        statusLabel.stringValue = "Pulling qwen2.5:0.5b..."
-        appendOutput("\n[pull] ollama pull qwen2.5:0.5b\n")
-        let result = runShellCommand("ollama pull qwen2.5:0.5b")
-        if !result.output.isEmpty {
-            appendOutput(result.output + "\n")
-        }
-        if result.status == 0 {
-            statusLabel.stringValue = "Model pulled. Refreshing list..."
-            reloadModels(preserveSelection: true)
-        } else {
-            statusLabel.stringValue = "Pull failed. Check Ollama service."
-        }
     }
 
     @objc private func sendPrompt() {
@@ -876,17 +2140,41 @@ private final class ChatWindowController: NSWindowController {
             return
         }
 
+        let runtimeTemplate = runtimeField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !runtimeTemplate.isEmpty else {
+            statusLabel.stringValue = "Set ANE runtime command template first."
+            return
+        }
+
         UserDefaults.standard.set(model, forKey: DefaultsKey.chatModel)
+        UserDefaults.standard.set(runtimeTemplate, forKey: DefaultsKey.chatRuntimeTemplate)
         promptField.stringValue = ""
 
         appendOutput("\nYou: \(prompt)\nAssistant: ")
         streamStartedAt = Date()
         streamTokenApproxCount = 0
 
-        let command = "ollama run \(shellQuote(model)) \(shellQuote(prompt))"
+        var command = runtimeTemplate
+            .replacingOccurrences(of: "{model}", with: shellQuote(model))
+            .replacingOccurrences(of: "{prompt}", with: shellQuote(prompt))
+            .replacingOccurrences(of: "{repo}", with: shellQuote(repoRoot))
+        if !runtimeTemplate.contains("{prompt}") {
+            command += " " + shellQuote(prompt)
+        }
+
+        if command.contains("{") && command.contains("}") {
+            statusLabel.stringValue = "Runtime template has unresolved placeholders."
+            appendOutput("\n[invalid runtime template]\n")
+            return
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-lc", command]
+        process.arguments = ["-c", command]
+        process.environment = defaultShellEnvironment()
+        if !repoRoot.isEmpty {
+            process.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
+        }
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -914,7 +2202,7 @@ private final class ChatWindowController: NSWindowController {
                     self?.statusLabel.stringValue = "Completed."
                     self?.appendOutput("\n")
                 } else {
-                    self?.statusLabel.stringValue = "Chat command failed (\(proc.terminationStatus))."
+                    self?.statusLabel.stringValue = "ANE chat command failed (\(proc.terminationStatus))."
                     self?.appendOutput("\n\n[chat failed]\n")
                 }
             }
@@ -925,10 +2213,10 @@ private final class ChatWindowController: NSWindowController {
             chatProcess = process
             sendButton.isEnabled = false
             stopButton.isEnabled = true
-            statusLabel.stringValue = "Streaming response..."
+            statusLabel.stringValue = "Streaming ANE response..."
         } catch {
             chatProcess = nil
-            statusLabel.stringValue = "Could not launch ollama. Is it installed/running?"
+            statusLabel.stringValue = "Could not launch ANE runtime command."
             appendOutput("\n[launch failed: \(error.localizedDescription)]\n")
         }
     }
@@ -1092,10 +2380,10 @@ private final class SystemMetricsSampler {
 
 private final class LiveMetricsMenuView: NSView {
     private var history: [LiveMetricsSample] = []
-    private let maxPoints = 120
+    private let maxPoints = 150
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: 360, height: 220)
+        NSSize(width: 432, height: 336)
     }
 
     func push(_ sample: LiveMetricsSample) {
@@ -1111,19 +2399,52 @@ private final class LiveMetricsMenuView: NSView {
             return
         }
 
-        let inset = bounds.insetBy(dx: 12, dy: 10)
+        NSColor.windowBackgroundColor.setFill()
+        dirtyRect.fill()
+
+        let panelRect = bounds.insetBy(dx: 8, dy: 6)
+        let panelPath = NSBezierPath(roundedRect: panelRect, xRadius: 10, yRadius: 10)
+        if let gradient = NSGradient(colors: [
+            NSColor.controlBackgroundColor.withAlphaComponent(0.86),
+            NSColor.controlBackgroundColor.withAlphaComponent(0.62),
+        ]) {
+            gradient.draw(in: panelPath, angle: -90)
+        } else {
+            NSColor.controlBackgroundColor.withAlphaComponent(0.74).setFill()
+            panelPath.fill()
+        }
+        NSColor.separatorColor.withAlphaComponent(0.25).setStroke()
+        panelPath.lineWidth = 1
+        panelPath.stroke()
+
+        let inset = panelRect.insetBy(dx: 14, dy: 14)
         let headerAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .font: NSFont.systemFont(ofSize: 16, weight: .bold),
             .foregroundColor: NSColor.labelColor,
         ]
         let textAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 14, weight: .semibold),
+            .foregroundColor: NSColor.labelColor,
+        ]
+        let subtleTextAttributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
             .foregroundColor: NSColor.secondaryLabelColor,
         ]
 
+        let subtitle = latest.runActive && latest.telemetrySource != "idle"
+            ? latest.telemetrySource
+            : "M-series realtime telemetry"
+
         NSString(string: "Live Silicon Graph").draw(
-            at: NSPoint(x: inset.minX, y: inset.maxY - 16),
+            at: NSPoint(x: inset.minX, y: inset.maxY - 24),
             withAttributes: headerAttributes
+        )
+        drawBadge(
+            text: subtitle,
+            in: NSRect(x: inset.maxX - 210, y: inset.maxY - 28, width: 210, height: 22),
+            fill: NSColor.tertiaryLabelColor.withAlphaComponent(0.12),
+            stroke: NSColor.separatorColor.withAlphaComponent(0.18),
+            attributes: subtleTextAttributes
         )
 
         drawProgressRow(
@@ -1166,20 +2487,8 @@ private final class LiveMetricsMenuView: NSView {
             dimmed: aneValue == nil
         )
 
-        let tflopsText: String
-        if let tflops = latest.aneTFLOPS {
-            tflopsText = String(format: "ANE TFLOPS %.2f", tflops)
-        } else {
-            tflopsText = "ANE TFLOPS n/a"
-        }
-        let footerText = String(format: "Load %.2f | CPU %.1f%% | %@", latest.load1m, latest.totalCPUUsage, tflopsText)
-        NSString(string: footerText).draw(
-            at: NSPoint(x: inset.minX, y: inset.minY + 80),
-            withAttributes: textAttributes
-        )
-
-        let graphRect = NSRect(x: inset.minX, y: inset.minY + 6, width: inset.width, height: 66)
-        drawGraph(in: graphRect)
+        let graphRect = NSRect(x: inset.minX, y: inset.minY + 4, width: inset.width, height: 136)
+        drawGraph(in: graphRect, latest: latest)
     }
 
     private func drawProgressRow(
@@ -1192,50 +2501,124 @@ private final class LiveMetricsMenuView: NSView {
         attributes: [NSAttributedString.Key: Any],
         dimmed: Bool = false
     ) {
-        let rowTop = rect.maxY - 38 - CGFloat(row) * 22
-        let labelWidth: CGFloat = 70
-        let valueWidth: CGFloat = 52
-        let barX = rect.minX + labelWidth + 8
-        let barWidth = rect.width - labelWidth - valueWidth - 20
-        let barRect = NSRect(x: barX, y: rowTop - 2, width: barWidth, height: 10)
+        let rowTop = rect.maxY - 60 - CGFloat(row) * 31
+        let labelWidth: CGFloat = 98
+        let valueWidth: CGFloat = 62
+        let barX = rect.minX + labelWidth + 10
+        let barWidth = rect.width - labelWidth - valueWidth - 28
+        let barRect = NSRect(x: barX, y: rowTop - 1, width: barWidth, height: 16)
 
         NSString(string: label).draw(
-            at: NSPoint(x: rect.minX, y: rowTop - 4),
+            at: NSPoint(x: rect.minX, y: rowTop - 5),
             withAttributes: attributes
         )
         NSString(string: valueText).draw(
-            at: NSPoint(x: barRect.maxX + 8, y: rowTop - 4),
+            at: NSPoint(x: barRect.maxX + 10, y: rowTop - 5),
             withAttributes: attributes
         )
 
-        let backgroundPath = NSBezierPath(roundedRect: barRect, xRadius: 4, yRadius: 4)
+        let backgroundPath = NSBezierPath(roundedRect: barRect, xRadius: 6, yRadius: 6)
         NSColor.tertiaryLabelColor.withAlphaComponent(0.18).setFill()
         backgroundPath.fill()
 
         let fillRatio = CGFloat(min(100, max(0, value)) / 100.0)
         let fillRect = NSRect(x: barRect.minX, y: barRect.minY, width: barRect.width * fillRatio, height: barRect.height)
-        let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 4, yRadius: 4)
+        let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 6, yRadius: 6)
         color.withAlphaComponent(dimmed ? 0.25 : 0.95).setFill()
         fillPath.fill()
     }
 
-    private func drawGraph(in rect: NSRect) {
+    private func drawGraph(in rect: NSRect, latest: LiveMetricsSample) {
+        let background = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
+        NSColor.black.withAlphaComponent(0.16).setFill()
+        background.fill()
+
         NSColor.tertiaryLabelColor.withAlphaComponent(0.2).setStroke()
-        let border = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+        let border = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
         border.lineWidth = 1
         border.stroke()
 
-        drawHorizontalGridLines(in: rect)
-        drawSeries(values: history.map(\.pCoreUsage), color: .systemOrange, in: rect)
-        drawSeries(values: history.map(\.eCoreUsage), color: .systemBlue, in: rect)
-        drawSeries(values: history.map(\.memoryUsage), color: .systemTeal, in: rect)
+        let headerRect = NSRect(x: rect.minX + 8, y: rect.maxY - 28, width: rect.width - 16, height: 20)
+        drawChipRow(
+            labels: chartChipLabels(for: latest),
+            in: headerRect
+        )
+
+        let plotRect = NSRect(x: rect.minX + 1, y: rect.minY + 1, width: rect.width - 2, height: rect.height - 30)
+        drawHorizontalGridLines(in: plotRect)
+        drawSeries(values: history.map(\.pCoreUsage), color: .systemOrange, in: plotRect)
+        drawSeries(values: history.map(\.eCoreUsage), color: .systemBlue, in: plotRect)
+        drawSeries(values: history.map(\.memoryUsage), color: .systemTeal, in: plotRect)
         if history.contains(where: { $0.aneUtilization != nil }) {
-            drawSeries(values: history.map { $0.aneUtilization ?? 0 }, color: .systemGreen.withAlphaComponent(0.8), in: rect)
+            drawSeries(values: history.map { $0.aneUtilization ?? 0 }, color: .systemGreen.withAlphaComponent(0.85), in: plotRect)
         }
     }
 
+    private func chartChipLabels(for latest: LiveMetricsSample) -> [String] {
+        let tflopsText: String
+        if let tflops = latest.aneTFLOPS {
+            tflopsText = String(format: "ANE %.2f TF", tflops)
+        } else {
+            tflopsText = "ANE TF n/a"
+        }
+        return [
+            String(format: "Load %.2f", latest.load1m),
+            String(format: "CPU %.1f%%", latest.totalCPUUsage),
+            tflopsText,
+        ]
+    }
+
+    private func drawChipRow(labels: [String], in rect: NSRect) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        var x = rect.minX
+        for label in labels {
+            let measured = NSString(string: label).size(withAttributes: attributes)
+            let chipWidth = min(rect.maxX - x, measured.width + 14)
+            guard chipWidth > 12 else {
+                break
+            }
+            let chipRect = NSRect(x: x, y: rect.minY, width: chipWidth, height: rect.height)
+            drawBadge(
+                text: label,
+                in: chipRect,
+                fill: NSColor.tertiaryLabelColor.withAlphaComponent(0.1),
+                stroke: NSColor.separatorColor.withAlphaComponent(0.16),
+                attributes: attributes
+            )
+            x += chipWidth + 8
+            if x >= rect.maxX {
+                break
+            }
+        }
+    }
+
+    private func drawBadge(
+        text: String,
+        in rect: NSRect,
+        fill: NSColor,
+        stroke: NSColor,
+        attributes: [NSAttributedString.Key: Any]
+    ) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
+        fill.setFill()
+        path.fill()
+        stroke.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        let size = NSString(string: text).size(withAttributes: attributes)
+        let point = NSPoint(
+            x: rect.midX - size.width / 2,
+            y: rect.midY - size.height / 2 + 1
+        )
+        NSString(string: text).draw(at: point, withAttributes: attributes)
+    }
+
     private func drawHorizontalGridLines(in rect: NSRect) {
-        let levels: [CGFloat] = [0.25, 0.5, 0.75]
+        let levels: [CGFloat] = [0.2, 0.4, 0.6, 0.8]
         NSColor.tertiaryLabelColor.withAlphaComponent(0.12).setStroke()
         for level in levels {
             let y = rect.minY + rect.height * level
@@ -1269,7 +2652,7 @@ private final class LiveMetricsMenuView: NSView {
         }
 
         color.setStroke()
-        path.lineWidth = 1.7
+        path.lineWidth = 2.6
         path.stroke()
     }
 
@@ -1282,6 +2665,9 @@ private final class LiveMetricsMenuView: NSView {
 final class ANEBarController: NSObject, NSApplicationDelegate {
     private enum DefaultsKey {
         static let repoRoot = "ane_repo_root"
+        static let compactMenubar = "anebar_compact_menubar"
+        static let compactLayout = "anebar_compact_layout"
+        static let keepMenuOpen = "anebar_keep_menu_open"
     }
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1294,24 +2680,34 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private var queueFullItem = NSMenuItem()
     private var queueBenchmarkItem = NSMenuItem()
     private var queueSummaryItem = NSMenuItem()
+    private var compactLayoutItem = NSMenuItem()
+    private var compactMenubarItem = NSMenuItem()
+    private var keepMenuOpenItem = NSMenuItem()
 
     private var statusLineItem = NSMenuItem()
     private var repoLineItem = NSMenuItem()
+    private var profileLineItem = NSMenuItem()
+    private var telemetryLineItem = NSMenuItem()
     private var guardrailItem = NSMenuItem()
 
     private var upstreamHeadItem = NSMenuItem()
     private var upstreamMetaItem = NSMenuItem()
     private var upstreamSyncItem = NSMenuItem()
+    private var refreshUpstreamItem = NSMenuItem()
 
     private var modelSummaryItem = NSMenuItem()
     private var modelDeltaItem = NSMenuItem()
     private var modelDetailItems: [NSMenuItem] = []
+    private var refreshModelsItem = NSMenuItem()
 
     private var historySummaryItem = NSMenuItem()
     private var historyDetailItem = NSMenuItem()
     private var historyDeltaItem = NSMenuItem()
 
-    private var metricsView = LiveMetricsMenuView(frame: NSRect(x: 0, y: 0, width: 360, height: 220))
+    private var metricsView = LiveMetricsMenuView(frame: NSRect(x: 0, y: 0, width: 432, height: 336))
+    private var telemetryWindowController: TelemetryWindowController?
+    private var experimentsWindowController: ExperimentConsoleWindowController?
+    private var historyWindowController: HistoryWindowController?
     private var chatWindowController: ChatWindowController?
 
     private let historyStore = RunHistoryStore()
@@ -1320,12 +2716,16 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private var process: Process?
     private var activeQueueItemID: String?
     private var runStartedAt: Date?
-    private var currentRunPreset: RunPreset?
+    private var currentRunExperimentID: String?
+    private var currentRunMode: String?
+    private var currentRunTitle: String?
     private var currentRunCommand: String?
+    private var currentRunWorkingDirectory: String?
     private var currentRunAneUtilization: Double?
     private var currentRunAneTFLOPS: Double?
     private var currentRunTotalTFLOPS: Double?
     private var currentRunAvgTrainMS: Double?
+    private var currentRunTelemetrySource: String?
 
     private var lastExitCode: Int32?
 
@@ -1345,6 +2745,24 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     private var lastSeenRepoSHA: String?
 
     private var metricsTick: Int = 0
+    private var repoProfile = RepoProfile(kind: .customFork, label: "custom-fork", detail: "Scanning repo…")
+    private var experimentCatalog: [ExperimentDefinition] = []
+    private var lastTelemetrySource: String?
+
+    private var compactMenubar: Bool {
+        get { boolDefault(key: DefaultsKey.compactMenubar, defaultValue: true) }
+        set { UserDefaults.standard.set(newValue, forKey: DefaultsKey.compactMenubar) }
+    }
+
+    private var compactLayout: Bool {
+        get { boolDefault(key: DefaultsKey.compactLayout, defaultValue: true) }
+        set { UserDefaults.standard.set(newValue, forKey: DefaultsKey.compactLayout) }
+    }
+
+    private var keepMenuOpenAfterAction: Bool {
+        get { boolDefault(key: DefaultsKey.keepMenuOpen, defaultValue: true) }
+        set { UserDefaults.standard.set(newValue, forKey: DefaultsKey.keepMenuOpen) }
+    }
 
     private var repoRoot: String {
         get {
@@ -1358,6 +2776,14 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(newValue, forKey: DefaultsKey.repoRoot)
             refreshInfoLines()
         }
+    }
+
+    private func boolDefault(key: String, defaultValue: Bool) -> Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: key) == nil {
+            return defaultValue
+        }
+        return defaults.bool(forKey: key)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1374,14 +2800,70 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         metricsTimer = nil
     }
 
+    @objc private func noopMenuItemAction(_ sender: Any?) {}
+
+    private func configureInfoItem(_ item: NSMenuItem) {
+        item.target = self
+        item.action = #selector(noopMenuItemAction(_:))
+        item.isEnabled = true
+    }
+
+    @objc private func toggleCompactLayout() {
+        compactLayout.toggle()
+        applyMenuDensity()
+        reopenMenuIfNeeded()
+    }
+
+    @objc private func toggleCompactMenubar() {
+        compactMenubar.toggle()
+        compactMenubarItem.state = compactMenubar ? .on : .off
+        updateStatusButton()
+        reopenMenuIfNeeded()
+    }
+
+    @objc private func toggleKeepMenuOpen() {
+        keepMenuOpenAfterAction.toggle()
+        keepMenuOpenItem.state = keepMenuOpenAfterAction ? .on : .off
+        if keepMenuOpenAfterAction {
+            reopenMenuIfNeeded()
+        }
+    }
+
+    private func reopenMenuIfNeeded() {
+        guard keepMenuOpenAfterAction, let button = statusItem.button else {
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self, weak button] in
+            guard let self, self.keepMenuOpenAfterAction else {
+                return
+            }
+            guard let button else {
+                return
+            }
+            button.performClick(nil)
+        }
+    }
+
+    private func applyMenuDensity() {
+        compactLayoutItem.state = compactLayout ? .on : .off
+        let hideAdvanced = compactLayout
+        let advancedItems = [repoLineItem, upstreamHeadItem, upstreamMetaItem, upstreamSyncItem, refreshUpstreamItem, modelDeltaItem, refreshModelsItem, historyDetailItem, historyDeltaItem]
+        for item in advancedItems {
+            item.isHidden = hideAdvanced
+        }
+        for item in modelDetailItems {
+            item.isHidden = hideAdvanced || item.title.isEmpty
+        }
+    }
+
     private func setupStatusItem() {
         if let button = statusItem.button {
-            button.title = "ANE"
+            button.title = ""
             button.toolTip = "ANEBar"
             if let image = NSImage(systemSymbolName: "cpu", accessibilityDescription: "ANEBar") {
                 image.isTemplate = true
                 button.image = image
-                button.imagePosition = .imageLeading
+                button.imagePosition = compactMenubar ? .imageOnly : .imageLeading
             }
         }
         statusItem.menu = menu
@@ -1397,141 +2879,194 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         menu.addItem(metricsItem)
         menu.addItem(.separator())
 
+        let viewMenuItem = NSMenuItem(title: "View Options", action: nil, keyEquivalent: "")
+        let viewSubmenu = NSMenu(title: "View Options")
+        viewMenuItem.submenu = viewSubmenu
+        menu.addItem(viewMenuItem)
+
+        compactLayoutItem = NSMenuItem(title: "Compact Menu Layout", action: #selector(toggleCompactLayout), keyEquivalent: "")
+        compactLayoutItem.target = self
+        viewSubmenu.addItem(compactLayoutItem)
+
+        compactMenubarItem = NSMenuItem(title: "Compact Menubar Label", action: #selector(toggleCompactMenubar), keyEquivalent: "")
+        compactMenubarItem.target = self
+        viewSubmenu.addItem(compactMenubarItem)
+
+        keepMenuOpenItem = NSMenuItem(title: "Keep Menu Open After Click", action: #selector(toggleKeepMenuOpen), keyEquivalent: "")
+        keepMenuOpenItem.target = self
+        viewSubmenu.addItem(keepMenuOpenItem)
+        menu.addItem(.separator())
+
         statusLineItem = NSMenuItem(title: "Status: idle", action: nil, keyEquivalent: "")
-        statusLineItem.isEnabled = false
+        configureInfoItem(statusLineItem)
         menu.addItem(statusLineItem)
 
         repoLineItem = NSMenuItem(title: "Repo: \(repoRoot)", action: nil, keyEquivalent: "")
-        repoLineItem.isEnabled = false
+        configureInfoItem(repoLineItem)
         menu.addItem(repoLineItem)
 
+        profileLineItem = NSMenuItem(title: "Profile: scanning…", action: nil, keyEquivalent: "")
+        configureInfoItem(profileLineItem)
+        menu.addItem(profileLineItem)
+
+        telemetryLineItem = NSMenuItem(title: "Telemetry: idle", action: nil, keyEquivalent: "")
+        configureInfoItem(telemetryLineItem)
+        menu.addItem(telemetryLineItem)
+
         guardrailItem = NSMenuItem(title: "Guardrails: checking…", action: nil, keyEquivalent: "")
-        guardrailItem.isEnabled = false
+        configureInfoItem(guardrailItem)
         menu.addItem(guardrailItem)
 
+        queueSummaryItem = NSMenuItem(title: "Queue: 0 pending", action: nil, keyEquivalent: "")
+        configureInfoItem(queueSummaryItem)
+        menu.addItem(queueSummaryItem)
+
+        modelSummaryItem = NSMenuItem(title: "Models: scanning…", action: nil, keyEquivalent: "")
+        configureInfoItem(modelSummaryItem)
+        menu.addItem(modelSummaryItem)
+
+        historySummaryItem = NSMenuItem(title: "Run history: none", action: nil, keyEquivalent: "")
+        configureInfoItem(historySummaryItem)
+        menu.addItem(historySummaryItem)
+
+        historyDetailItem = NSMenuItem(title: "Last metrics: n/a", action: nil, keyEquivalent: "")
+        configureInfoItem(historyDetailItem)
+        menu.addItem(historyDetailItem)
+
+        historyDeltaItem = NSMenuItem(title: "Comparison: n/a", action: nil, keyEquivalent: "")
+        configureInfoItem(historyDeltaItem)
+        menu.addItem(historyDeltaItem)
+
         upstreamHeadItem = NSMenuItem(title: "HEAD: scanning…", action: nil, keyEquivalent: "")
-        upstreamHeadItem.isEnabled = false
+        configureInfoItem(upstreamHeadItem)
         menu.addItem(upstreamHeadItem)
 
         upstreamMetaItem = NSMenuItem(title: "Repo status: unknown", action: nil, keyEquivalent: "")
-        upstreamMetaItem.isEnabled = false
+        configureInfoItem(upstreamMetaItem)
         menu.addItem(upstreamMetaItem)
 
         upstreamSyncItem = NSMenuItem(title: "Sync: unknown", action: nil, keyEquivalent: "")
-        upstreamSyncItem.isEnabled = false
+        configureInfoItem(upstreamSyncItem)
         menu.addItem(upstreamSyncItem)
 
-        let refreshUpstreamItem = NSMenuItem(title: "Refresh Repo Head", action: #selector(refreshUpstreamManual), keyEquivalent: "u")
+        refreshUpstreamItem = NSMenuItem(title: "Refresh Repo Head", action: #selector(refreshUpstreamManual), keyEquivalent: "u")
         refreshUpstreamItem.target = self
-        menu.addItem(refreshUpstreamItem)
 
         menu.addItem(.separator())
 
-        modelSummaryItem = NSMenuItem(title: "Models: scanning…", action: nil, keyEquivalent: "")
-        modelSummaryItem.isEnabled = false
-        menu.addItem(modelSummaryItem)
-
         modelDeltaItem = NSMenuItem(title: "Model delta: baseline", action: nil, keyEquivalent: "")
-        modelDeltaItem.isEnabled = false
+        configureInfoItem(modelDeltaItem)
         menu.addItem(modelDeltaItem)
 
         for _ in 0..<6 {
             let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-            item.isEnabled = false
+            configureInfoItem(item)
             item.isHidden = true
             modelDetailItems.append(item)
             menu.addItem(item)
         }
 
-        let refreshModelsItem = NSMenuItem(title: "Refresh Model Index", action: #selector(refreshModelIndexManual), keyEquivalent: "m")
+        refreshModelsItem = NSMenuItem(title: "Refresh Model Index", action: #selector(refreshModelIndexManual), keyEquivalent: "m")
         refreshModelsItem.target = self
-        menu.addItem(refreshModelsItem)
 
         menu.addItem(.separator())
 
-        runFastItem = NSMenuItem(title: RunPreset.fast.menuTitle, action: #selector(runFastPipeline), keyEquivalent: "r")
-        runFastItem.target = self
-        menu.addItem(runFastItem)
+        let openExperimentsItem = NSMenuItem(title: "Open Experiment Console", action: #selector(openExperimentConsole), keyEquivalent: "x")
+        openExperimentsItem.target = self
+        menu.addItem(openExperimentsItem)
 
-        runFullItem = NSMenuItem(title: RunPreset.full.menuTitle, action: #selector(runFullPipeline), keyEquivalent: "R")
-        runFullItem.target = self
-        menu.addItem(runFullItem)
+        let openTelemetryItem = NSMenuItem(title: "Open Telemetry Panel", action: #selector(openTelemetryPanel), keyEquivalent: "t")
+        openTelemetryItem.target = self
+        menu.addItem(openTelemetryItem)
 
-        runBenchmarkItem = NSMenuItem(title: RunPreset.benchmark.menuTitle, action: #selector(runBenchmarkPipeline), keyEquivalent: "b")
-        runBenchmarkItem.target = self
-        menu.addItem(runBenchmarkItem)
-
-        queueFastItem = NSMenuItem(title: "Queue Fast", action: #selector(queueFastRun), keyEquivalent: "")
-        queueFastItem.target = self
-        menu.addItem(queueFastItem)
-
-        queueFullItem = NSMenuItem(title: "Queue Full", action: #selector(queueFullRun), keyEquivalent: "")
-        queueFullItem.target = self
-        menu.addItem(queueFullItem)
-
-        queueBenchmarkItem = NSMenuItem(title: "Queue Benchmark (+10m)", action: #selector(queueBenchmarkRunDelayed), keyEquivalent: "")
-        queueBenchmarkItem.target = self
-        menu.addItem(queueBenchmarkItem)
-
-        queueSummaryItem = NSMenuItem(title: "Queue: 0 pending", action: nil, keyEquivalent: "")
-        queueSummaryItem.isEnabled = false
-        menu.addItem(queueSummaryItem)
-
-        let clearQueueItem = NSMenuItem(title: "Clear Pending Queue", action: #selector(clearPendingQueue), keyEquivalent: "")
-        clearQueueItem.target = self
-        menu.addItem(clearQueueItem)
-
-        let openChatItem = NSMenuItem(title: "Open Local Chat", action: #selector(openLocalChat), keyEquivalent: "l")
-        openChatItem.target = self
-        menu.addItem(openChatItem)
-
-        let stopItem = NSMenuItem(title: "Stop Running Job", action: #selector(stopJob), keyEquivalent: "s")
-        stopItem.target = self
-        menu.addItem(stopItem)
-
-        menu.addItem(.separator())
-
-        historySummaryItem = NSMenuItem(title: "Run history: none", action: nil, keyEquivalent: "")
-        historySummaryItem.isEnabled = false
-        menu.addItem(historySummaryItem)
-
-        historyDetailItem = NSMenuItem(title: "Last metrics: n/a", action: nil, keyEquivalent: "")
-        historyDetailItem.isEnabled = false
-        menu.addItem(historyDetailItem)
-
-        historyDeltaItem = NSMenuItem(title: "Comparison: n/a", action: nil, keyEquivalent: "")
-        historyDeltaItem.isEnabled = false
-        menu.addItem(historyDeltaItem)
-
-        let openHistoryItem = NSMenuItem(title: "Open Run History JSON", action: #selector(openRunHistoryFile), keyEquivalent: "j")
+        let openHistoryItem = NSMenuItem(title: "Open History", action: #selector(openHistoryPanel), keyEquivalent: "j")
         openHistoryItem.target = self
         menu.addItem(openHistoryItem)
 
+        let actionsMenuItem = NSMenuItem(title: "Quick Actions", action: nil, keyEquivalent: "")
+        let actionsSubmenu = NSMenu(title: "Quick Actions")
+        actionsMenuItem.submenu = actionsSubmenu
+        menu.addItem(actionsMenuItem)
+
+        runFastItem = NSMenuItem(title: RunPreset.fast.menuTitle, action: #selector(runFastPipeline), keyEquivalent: "r")
+        runFastItem.target = self
+        actionsSubmenu.addItem(runFastItem)
+
+        runFullItem = NSMenuItem(title: RunPreset.full.menuTitle, action: #selector(runFullPipeline), keyEquivalent: "R")
+        runFullItem.target = self
+        actionsSubmenu.addItem(runFullItem)
+
+        runBenchmarkItem = NSMenuItem(title: RunPreset.benchmark.menuTitle, action: #selector(runBenchmarkPipeline), keyEquivalent: "b")
+        runBenchmarkItem.target = self
+        actionsSubmenu.addItem(runBenchmarkItem)
+        actionsSubmenu.addItem(.separator())
+
+        queueFastItem = NSMenuItem(title: "Queue Fast", action: #selector(queueFastRun), keyEquivalent: "")
+        queueFastItem.target = self
+        actionsSubmenu.addItem(queueFastItem)
+
+        queueFullItem = NSMenuItem(title: "Queue Full", action: #selector(queueFullRun), keyEquivalent: "")
+        queueFullItem.target = self
+        actionsSubmenu.addItem(queueFullItem)
+
+        queueBenchmarkItem = NSMenuItem(title: "Queue Benchmark (+10m)", action: #selector(queueBenchmarkRunDelayed), keyEquivalent: "")
+        queueBenchmarkItem.target = self
+        actionsSubmenu.addItem(queueBenchmarkItem)
+
+        let clearQueueItem = NSMenuItem(title: "Clear Pending Queue", action: #selector(clearPendingQueue), keyEquivalent: "")
+        clearQueueItem.target = self
+        actionsSubmenu.addItem(clearQueueItem)
+        actionsSubmenu.addItem(.separator())
+
+        let openChatItem = NSMenuItem(title: "Open ANE Chat", action: #selector(openLocalChat), keyEquivalent: "l")
+        openChatItem.target = self
+        actionsSubmenu.addItem(openChatItem)
+
+        let stopItem = NSMenuItem(title: "Stop Running Job", action: #selector(stopJob), keyEquivalent: "s")
+        stopItem.target = self
+        actionsSubmenu.addItem(stopItem)
+
+        let reportsMenuItem = NSMenuItem(title: "Reports & Files", action: nil, keyEquivalent: "")
+        let reportsSubmenu = NSMenu(title: "Reports & Files")
+        reportsMenuItem.submenu = reportsSubmenu
+        menu.addItem(reportsMenuItem)
+
+        let openHistoryJSONItem = NSMenuItem(title: "Open Run History JSON", action: #selector(openRunHistoryFile), keyEquivalent: "")
+        openHistoryJSONItem.target = self
+        reportsSubmenu.addItem(openHistoryJSONItem)
+
         let exportBundleItem = NSMenuItem(title: "Export Repro Bundle", action: #selector(exportReproBundle), keyEquivalent: "e")
         exportBundleItem.target = self
-        menu.addItem(exportBundleItem)
+        reportsSubmenu.addItem(exportBundleItem)
 
         let openBenchmarkSummaryItem = NSMenuItem(title: "Open Benchmark Summary", action: #selector(openBenchmarkSummary), keyEquivalent: "k")
         openBenchmarkSummaryItem.target = self
-        menu.addItem(openBenchmarkSummaryItem)
-
-        menu.addItem(.separator())
+        reportsSubmenu.addItem(openBenchmarkSummaryItem)
 
         let openResultsItem = NSMenuItem(title: "Open Results Folder", action: #selector(openResultsFolder), keyEquivalent: "o")
         openResultsItem.target = self
-        menu.addItem(openResultsItem)
+        reportsSubmenu.addItem(openResultsItem)
+
+        reportsSubmenu.addItem(.separator())
+        reportsSubmenu.addItem(refreshUpstreamItem)
+        reportsSubmenu.addItem(refreshModelsItem)
+
+        let mediaMenuItem = NSMenuItem(title: "Studio Assets", action: nil, keyEquivalent: "")
+        let mediaSubmenu = NSMenu(title: "Studio Assets")
+        mediaMenuItem.submenu = mediaSubmenu
+        menu.addItem(mediaMenuItem)
 
         let openHeroItem = NSMenuItem(title: "Open Hero Graphic", action: #selector(openHeroGraphic), keyEquivalent: "h")
         openHeroItem.target = self
-        menu.addItem(openHeroItem)
+        mediaSubmenu.addItem(openHeroItem)
 
         let openSignalItem = NSMenuItem(title: "Open Community Spotlight Graphic", action: #selector(openSpotlightGraphic), keyEquivalent: "g")
         openSignalItem.target = self
-        menu.addItem(openSignalItem)
+        mediaSubmenu.addItem(openSignalItem)
 
         let copyPostItem = NSMenuItem(title: "Copy Today Post", action: #selector(copyTodayPost), keyEquivalent: "c")
         copyPostItem.target = self
-        menu.addItem(copyPostItem)
+        mediaSubmenu.addItem(copyPostItem)
 
         menu.addItem(.separator())
 
@@ -1542,18 +3077,27 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         let quitItem = NSMenuItem(title: "Quit ANEBar", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+
+        compactLayoutItem.state = compactLayout ? .on : .off
+        compactMenubarItem.state = compactMenubar ? .on : .off
+        keepMenuOpenItem.state = keepMenuOpenAfterAction ? .on : .off
+        applyMenuDensity()
     }
 
     private func refreshInfoLines() {
-        repoLineItem.title = "Repo: \(repoRoot)"
+        repoLineItem.title = "Repo: \(abbreviatedPath(repoRoot, maxLength: 54))"
+        repoLineItem.toolTip = repoRoot
         if let code = lastExitCode {
             statusLineItem.title = code == 0 ? "Status: last run succeeded" : "Status: last run failed (\(code))"
         }
+        refreshRepoContext()
+        refreshTelemetryLine()
         refreshGuardrailLine()
         refreshModelIndex(force: true)
         refreshUpstreamInfo(force: true)
         refreshQueueSummary()
         refreshRunHistoryLines()
+        applyMenuDensity()
     }
 
     private func setRunning(_ running: Bool, message: String) {
@@ -1563,83 +3107,163 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         queueFastItem.isEnabled = !running
         queueFullItem.isEnabled = !running
         queueBenchmarkItem.isEnabled = !running
+        experimentsWindowController?.setBusy(running)
+        historyWindowController?.setBusy(running)
         statusLineItem.title = "Status: \(message)"
         updateStatusButton()
     }
 
-    private func command(for preset: RunPreset) -> String? {
-        let fileManager = FileManager.default
-        let researchScript = "\(repoRoot)/training/research/run_research.py"
-        if fileManager.fileExists(atPath: researchScript) {
+    private func refreshRepoContext() {
+        repoProfile = detectRepoProfile(in: repoRoot)
+        experimentCatalog = discoverExperimentCatalog(in: repoRoot, profile: repoProfile)
+        let runnableCount = experimentCatalog.filter(\.isRunnable).count
+        let advancedCount = experimentCatalog.filter(\.advanced).count
+        profileLineItem.title = "Profile: \(repoProfile.label) | \(runnableCount) runnable | \(advancedCount) advanced"
+        profileLineItem.toolTip = repoProfile.detail
+        experimentsWindowController?.update(profile: repoProfile, experiments: experimentCatalog)
+        experimentsWindowController?.setBusy(process != nil)
+        telemetryWindowController?.updateContext(
+            repoProfile: repoProfile,
+            repoRoot: repoRoot,
+            currentRunTitle: currentRunTitle,
+            telemetrySource: currentRunTelemetrySource ?? lastTelemetrySource
+        )
+    }
+
+    private func refreshTelemetryLine() {
+        let source = currentRunTelemetrySource ?? lastTelemetrySource ?? "idle"
+        telemetryLineItem.title = "Telemetry: \(source)"
+        telemetryWindowController?.updateContext(
+            repoProfile: repoProfile,
+            repoRoot: repoRoot,
+            currentRunTitle: currentRunTitle,
+            telemetrySource: source
+        )
+    }
+
+    private func setTelemetrySource(_ source: String, persistAsLast: Bool = true) {
+        currentRunTelemetrySource = source
+        if persistAsLast {
+            lastTelemetrySource = source
+        }
+        refreshTelemetryLine()
+    }
+
+    private func experimentByID(_ id: String) -> ExperimentDefinition? {
+        experimentCatalog.first { $0.id == id }
+    }
+
+    private func wrappedLegacyExperiment(from base: ExperimentDefinition, preset: RunPreset, title: String, runCommand: String?) -> ExperimentDefinition {
+        var wrapped = base
+        wrapped.id = "preset.\(preset.rawValue)"
+        wrapped.title = title
+        wrapped.summary = "Legacy preset wrapper around \(base.title)."
+        wrapped.runCommand = runCommand
+        return wrapped
+    }
+
+    private func experiment(for preset: RunPreset) -> ExperimentDefinition? {
+        if repoProfile.kind == .labEnhanced, let lab = experimentByID("lab_research") {
             switch preset {
             case .fast:
-                return "uv run python training/research/run_research.py --qos-runs 2 --skip-build"
+                return wrappedLegacyExperiment(
+                    from: lab,
+                    preset: preset,
+                    title: "Fast Preset",
+                    runCommand: "uv run python training/research/run_research.py --qos-runs 2 --skip-build"
+                )
             case .full:
-                return "uv run python training/research/run_research.py --qos-runs 3"
+                return wrappedLegacyExperiment(
+                    from: lab,
+                    preset: preset,
+                    title: "Full Preset",
+                    runCommand: "uv run python training/research/run_research.py --qos-runs 3"
+                )
             case .benchmark:
-                return "uv run python training/research/run_research.py --qos-runs 5"
+                return wrappedLegacyExperiment(
+                    from: lab,
+                    preset: preset,
+                    title: "Benchmark Preset",
+                    runCommand: "uv run python training/research/run_research.py --qos-runs 5"
+                )
             }
         }
 
-        let makefile = "\(repoRoot)/training/Makefile"
-        let hasMakefile = fileManager.fileExists(atPath: makefile)
-        if hasMakefile {
-            let aneTargetPath = "\(repoRoot)/training/train_large_ane.m"
-            let standardTargetPath = "\(repoRoot)/training/train_large.m"
-            let target: String
-            if fileManager.fileExists(atPath: aneTargetPath) {
-                target = "train_large_ane"
-            } else if fileManager.fileExists(atPath: standardTargetPath) {
-                target = "train_large"
-            } else {
-                return nil
-            }
+        if preset == .benchmark, let peak = experimentByID("inmem_peak") {
+            return wrappedLegacyExperiment(
+                from: peak,
+                preset: preset,
+                title: "Benchmark Preset",
+                runCommand: peak.runCommand
+            )
+        }
 
+        if let training = experimentByID("train_large_ane") ?? experimentByID("train_large") {
+            let binary = training.id == "train_large_ane" ? "train_large_ane" : "train_large"
             let steps: Int
+            let title: String
             switch preset {
             case .fast:
                 steps = 40
+                title = "Fast Preset"
             case .full:
                 steps = 200
+                title = "Full Preset"
             case .benchmark:
                 steps = 100
+                title = "Benchmark Preset"
             }
+            return wrappedLegacyExperiment(
+                from: training,
+                preset: preset,
+                title: title,
+                runCommand: "./training/\(binary) --steps \(steps) --lr 1e-4"
+            )
+        }
 
-            return "make -C training \(target) && ./training/\(target) --steps \(steps)"
+        if let fallback = experimentCatalog.first(where: \.isRunnable) {
+            return wrappedLegacyExperiment(
+                from: fallback,
+                preset: preset,
+                title: preset.menuTitle,
+                runCommand: fallback.runCommand
+            )
         }
 
         return nil
     }
 
-    private func runPreset(_ preset: RunPreset, queueItemID: String? = nil) {
+    private func runResolvedCommand(
+        experimentID: String?,
+        mode: String,
+        title: String,
+        command: String,
+        workingDirectory: String,
+        queueItemID: String? = nil
+    ) {
         guard process == nil else {
             return
         }
-
-        guard let command = command(for: preset) else {
-            statusLineItem.title = "Status: no matching run command for repo"
-            return
-        }
-
-        if let guardrailMessage = guardrailBlockReason(for: preset) {
-            statusLineItem.title = "Status: blocked by guardrail (\(guardrailMessage))"
-            refreshGuardrailLine()
-            return
-        }
-
-        currentRunPreset = preset
+        currentRunExperimentID = experimentID
+        currentRunMode = mode
+        currentRunTitle = title
         currentRunCommand = command
+        currentRunWorkingDirectory = workingDirectory
         currentRunAneUtilization = nil
         currentRunAneTFLOPS = nil
         currentRunTotalTFLOPS = nil
         currentRunAvgTrainMS = nil
+        currentRunTelemetrySource = "awaiting output"
+        refreshTelemetryLine()
+        processOutputBuffer = ""
         runStartedAt = Date()
         activeQueueItemID = queueItemID
 
         let proc = Process()
-        proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
+        proc.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = ["-lc", command]
+        proc.arguments = ["-c", command]
+        proc.environment = defaultShellEnvironment()
 
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -1655,7 +3279,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             }
         }
 
-        setRunning(true, message: "running \(preset.displayTitle) preset")
+        setRunning(true, message: "running \(title)")
         process = proc
 
         proc.terminationHandler = { [weak self, weak pipe] finished in
@@ -1682,13 +3306,83 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func runPreset(_ preset: RunPreset, queueItemID: String? = nil) {
+        guard let experiment = experiment(for: preset) else {
+            statusLineItem.title = "Status: no matching run command for repo"
+            return
+        }
+        runExperiment(experiment, queueItemID: queueItemID)
+    }
+
+    private func guardrailBlockReason(for experiment: ExperimentDefinition) -> String? {
+        switch experiment.group {
+        case .validation, .bridge:
+            return nil
+        case .peak, .training, .dynamic, .lab:
+            break
+        }
+
+        let thermal = ProcessInfo.processInfo.thermalState
+        if thermal == .serious || thermal == .critical {
+            return "thermal \(thermalLabel(thermal))"
+        }
+        let battery = readBatteryStatus()
+        if let percent = battery.percent, !battery.isCharging, percent < 30 {
+            return "battery \(percent)% and unplugged"
+        }
+        return nil
+    }
+
+    private func runExperiment(_ experiment: ExperimentDefinition, queueItemID: String? = nil) {
+        guard let command = experiment.resolvedCommand(repoRoot: repoRoot) else {
+            statusLineItem.title = "Status: \(experiment.title) is catalogued only"
+            return
+        }
+        if let reason = guardrailBlockReason(for: experiment) {
+            statusLineItem.title = "Status: blocked by guardrail (\(reason))"
+            refreshGuardrailLine()
+            return
+        }
+        runResolvedCommand(
+            experimentID: experiment.id,
+            mode: experiment.runLabel,
+            title: experiment.title,
+            command: command,
+            workingDirectory: experiment.resolvedWorkingDirectory(repoRoot: repoRoot),
+            queueItemID: queueItemID
+        )
+    }
+
+    private func queueExperiment(_ experiment: ExperimentDefinition, delaySeconds: TimeInterval = 0) {
+        guard experiment.isRunnable else {
+            statusLineItem.title = "Status: \(experiment.title) is catalogued only"
+            return
+        }
+        _ = queueStore.enqueue(experiment: experiment, delaySeconds: delaySeconds)
+        refreshQueueSummary()
+        statusLineItem.title = delaySeconds > 0
+            ? "Status: queued \(experiment.title) (+\(Int(delaySeconds / 60))m)"
+            : "Status: queued \(experiment.title)"
+    }
+
+    private func copyCommandForExperiment(_ experiment: ExperimentDefinition) -> String? {
+        if let command = experiment.resolvedCommand(repoRoot: repoRoot) {
+            return "cd \(shellQuote(experiment.resolvedWorkingDirectory(repoRoot: repoRoot))) && \(command)"
+        }
+        return experiment.sourcePath
+    }
+
     private func persistRunResult(exitCode: Int32) {
-        guard let preset = currentRunPreset,
+        guard let mode = currentRunMode,
               let command = currentRunCommand,
               let startedAt = runStartedAt
         else {
-            currentRunPreset = nil
+            currentRunExperimentID = nil
+            currentRunMode = nil
+            currentRunTitle = nil
             currentRunCommand = nil
+            currentRunWorkingDirectory = nil
+            currentRunTelemetrySource = nil
             runStartedAt = nil
             return
         }
@@ -1700,9 +3394,13 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
 
         let record = RunRecord(
             id: UUID().uuidString,
-            mode: preset.rawValue,
+            mode: mode,
+            experimentID: currentRunExperimentID,
+            group: currentRunExperimentID.flatMap { experimentByID($0)?.group.rawValue },
+            title: currentRunTitle,
             command: command,
             repoRoot: repoRoot,
+            workingDirectory: currentRunWorkingDirectory,
             repoHead: lastSeenRepoSHA,
             startedAt: startedAt,
             endedAt: endedAt,
@@ -1711,7 +3409,8 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             aneUtilization: currentRunAneUtilization,
             aneTFLOPS: currentRunAneTFLOPS,
             totalTFLOPS: currentRunTotalTFLOPS,
-            avgTrainMS: currentRunAvgTrainMS
+            avgTrainMS: currentRunAvgTrainMS,
+            telemetrySource: currentRunTelemetrySource == "awaiting output" ? nil : currentRunTelemetrySource
         )
 
         historyStore.append(record)
@@ -1722,52 +3421,152 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         refreshRunHistoryLines()
         refreshQueueSummary()
 
-        currentRunPreset = nil
+        currentRunExperimentID = nil
+        currentRunMode = nil
+        currentRunTitle = nil
         currentRunCommand = nil
+        currentRunWorkingDirectory = nil
+        currentRunTelemetrySource = nil
         runStartedAt = nil
         activeQueueItemID = nil
+        refreshTelemetryLine()
     }
 
     @objc private func runFastPipeline() {
         runPreset(.fast)
+        reopenMenuIfNeeded()
     }
 
     @objc private func runFullPipeline() {
         runPreset(.full)
+        reopenMenuIfNeeded()
     }
 
     @objc private func runBenchmarkPipeline() {
         runPreset(.benchmark)
+        reopenMenuIfNeeded()
     }
 
     @objc private func queueFastRun() {
-        _ = queueStore.enqueue(preset: .fast)
-        refreshQueueSummary()
-        statusLineItem.title = "Status: queued fast preset"
+        if let experiment = experiment(for: .fast) {
+            queueExperiment(experiment)
+        } else {
+            _ = queueStore.enqueue(preset: .fast)
+            refreshQueueSummary()
+            statusLineItem.title = "Status: queued fast preset"
+        }
+        reopenMenuIfNeeded()
     }
 
     @objc private func queueFullRun() {
-        _ = queueStore.enqueue(preset: .full)
-        refreshQueueSummary()
-        statusLineItem.title = "Status: queued full preset"
+        if let experiment = experiment(for: .full) {
+            queueExperiment(experiment)
+        } else {
+            _ = queueStore.enqueue(preset: .full)
+            refreshQueueSummary()
+            statusLineItem.title = "Status: queued full preset"
+        }
+        reopenMenuIfNeeded()
     }
 
     @objc private func queueBenchmarkRunDelayed() {
-        _ = queueStore.enqueue(preset: .benchmark, delaySeconds: 10 * 60)
-        refreshQueueSummary()
-        statusLineItem.title = "Status: queued benchmark (+10m)"
+        if let experiment = experiment(for: .benchmark) {
+            queueExperiment(experiment, delaySeconds: 10 * 60)
+        } else {
+            _ = queueStore.enqueue(preset: .benchmark, delaySeconds: 10 * 60)
+            refreshQueueSummary()
+            statusLineItem.title = "Status: queued benchmark (+10m)"
+        }
+        reopenMenuIfNeeded()
     }
 
     @objc private func clearPendingQueue() {
         queueStore.cancelAllPending()
         refreshQueueSummary()
         statusLineItem.title = "Status: cleared pending queue"
+        reopenMenuIfNeeded()
+    }
+
+    @objc private func openExperimentConsole() {
+        if experimentsWindowController == nil {
+            let controller = ExperimentConsoleWindowController()
+            controller.onRunExperiment = { [weak self] experiment in
+                self?.runExperiment(experiment)
+            }
+            controller.onQueueExperiment = { [weak self] experiment in
+                self?.queueExperiment(experiment)
+            }
+            controller.onCopyExperimentCommand = { [weak self] experiment in
+                self?.copyCommandForExperiment(experiment)
+            }
+            controller.onRefresh = { [weak self] in
+                self?.refreshRepoContext()
+            }
+            experimentsWindowController = controller
+        }
+        refreshRepoContext()
+        experimentsWindowController?.setBusy(process != nil)
+        experimentsWindowController?.showWindow(nil)
+        experimentsWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        reopenMenuIfNeeded()
+    }
+
+    @objc private func openTelemetryPanel() {
+        if telemetryWindowController == nil {
+            telemetryWindowController = TelemetryWindowController()
+        }
+        telemetryWindowController?.updateContext(
+            repoProfile: repoProfile,
+            repoRoot: repoRoot,
+            currentRunTitle: currentRunTitle,
+            telemetrySource: currentRunTelemetrySource ?? lastTelemetrySource
+        )
+        if let latestMetrics {
+            telemetryWindowController?.push(sample: latestMetrics)
+        }
+        telemetryWindowController?.showWindow(nil)
+        telemetryWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        reopenMenuIfNeeded()
+    }
+
+    @objc private func openHistoryPanel() {
+        if historyWindowController == nil {
+            let controller = HistoryWindowController()
+            controller.onRerun = { [weak self] record in
+                self?.rerunRecord(record)
+            }
+            controller.onCopyCommand = { [weak self] record in
+                self?.copyCommandForRecord(record)
+            }
+            controller.onExportRepro = { [weak self] in
+                self?.exportReproBundle()
+            }
+            controller.onOpenSummary = { [weak self] in
+                self?.openBenchmarkSummary()
+            }
+            controller.onOpenHistoryJSON = { [weak self] in
+                self?.openRunHistoryFile()
+            }
+            controller.onCopySocialSnippet = { [weak self] record, compare in
+                self?.socialSnippet(for: record, comparedTo: compare)
+            }
+            historyWindowController = controller
+        }
+        historyWindowController?.update(records: historyStore.recentDescending(limit: 120), repoRoot: repoRoot)
+        historyWindowController?.setBusy(process != nil)
+        historyWindowController?.showWindow(nil)
+        historyWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        reopenMenuIfNeeded()
     }
 
     @objc private func openLocalChat() {
         if chatWindowController == nil {
             chatWindowController = ChatWindowController()
         }
+        chatWindowController?.setRepoRoot(repoRoot)
         let fallbackModels = lastModelCatalog?.artifacts
             .prefix(8)
             .map { URL(fileURLWithPath: $0.relativePath).deletingPathExtension().lastPathComponent } ?? []
@@ -1775,10 +3574,12 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         chatWindowController?.showWindow(nil)
         chatWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        reopenMenuIfNeeded()
     }
 
     @objc private func stopJob() {
         process?.terminate()
+        reopenMenuIfNeeded()
     }
 
     @objc private func openResultsFolder() {
@@ -1788,6 +3589,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             repoRoot,
         ]
         openFirstExistingPath(candidates)
+        reopenMenuIfNeeded()
     }
 
     @objc private func openHeroGraphic() {
@@ -1797,6 +3599,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             "\(repoRoot)/README.md",
         ]
         openFirstExistingPath(candidates)
+        reopenMenuIfNeeded()
     }
 
     @objc private func openSpotlightGraphic() {
@@ -1806,6 +3609,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             "\(repoRoot)/README.md",
         ]
         openFirstExistingPath(candidates)
+        reopenMenuIfNeeded()
     }
 
     @objc private func copyTodayPost() {
@@ -1820,15 +3624,72 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
                 pasteboard.clearContents()
                 pasteboard.setString(text, forType: .string)
                 statusLineItem.title = "Status: post draft copied"
+                reopenMenuIfNeeded()
                 return
             }
         }
 
         statusLineItem.title = "Status: could not find post draft"
+        reopenMenuIfNeeded()
     }
 
     @objc private func openRunHistoryFile() {
         NSWorkspace.shared.open(historyStore.fileURL)
+        reopenMenuIfNeeded()
+    }
+
+    private func rerunRecord(_ record: RunRecord) {
+        guard process == nil else {
+            statusLineItem.title = "Status: already running a job"
+            return
+        }
+        let workingDirectory: String
+        if let saved = record.workingDirectory, !saved.isEmpty {
+            workingDirectory = saved
+        } else if let experimentID = record.experimentID, let experiment = experimentByID(experimentID) {
+            workingDirectory = experiment.resolvedWorkingDirectory(repoRoot: repoRoot)
+        } else {
+            workingDirectory = record.repoRoot
+        }
+        runResolvedCommand(
+            experimentID: record.experimentID,
+            mode: record.mode,
+            title: record.title ?? record.mode,
+            command: record.command,
+            workingDirectory: workingDirectory
+        )
+    }
+
+    private func copyCommandForRecord(_ record: RunRecord) -> String {
+        if let experimentID = record.experimentID, let experiment = experimentByID(experimentID), let command = copyCommandForExperiment(experiment) {
+            return command
+        }
+        let workingDirectory = (record.workingDirectory?.isEmpty == false ? record.workingDirectory : record.repoRoot) ?? record.repoRoot
+        return "cd \(shellQuote(workingDirectory)) && \(record.command)"
+    }
+
+    private func socialSnippet(for record: RunRecord, comparedTo compare: RunRecord?) -> String {
+        var parts: [String] = []
+        parts.append(record.title ?? record.mode)
+        if let tflops = record.aneTFLOPS {
+            parts.append(String(format: "ANE %.2f TFLOPS", tflops))
+        }
+        if let util = record.aneUtilization {
+            parts.append(String(format: "util %.1f%%", util))
+        }
+        if let avgTrainMS = record.avgTrainMS {
+            parts.append(String(format: "avg %.1f ms", avgTrainMS))
+        }
+        if let compare,
+           let latest = record.aneTFLOPS,
+           let previous = compare.aneTFLOPS
+        {
+            parts.append("delta " + formatSigned(latest - previous, suffix: " TFLOPS"))
+        }
+        if let head = record.repoHead, !head.isEmpty {
+            parts.append("head \(head)")
+        }
+        return parts.joined(separator: " | ")
     }
 
     @objc private func chooseRepoRoot() {
@@ -1849,10 +3710,12 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
 
     @objc private func refreshModelIndexManual() {
         refreshModelIndex(force: true)
+        reopenMenuIfNeeded()
     }
 
     @objc private func refreshUpstreamManual() {
         refreshUpstreamInfo(force: true)
+        reopenMenuIfNeeded()
     }
 
     @objc private func quit() {
@@ -1890,6 +3753,9 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         if metricsTick % 30 == 0 {
             refreshUpstreamInfo(force: false)
         }
+        if metricsTick % 60 == 0 {
+            refreshRepoContext()
+        }
         if metricsTick % 5 == 0, let command = currentRunCommand {
             hydrateMetricsFromResearchArtifactsIfNeeded(command: command)
         }
@@ -1908,11 +3774,13 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             load1m: metricsSampler.sampleLoadAverage1m(),
             aneUtilization: activeANEUtilization(),
             aneTFLOPS: activeANETflops(),
+            telemetrySource: currentRunTelemetrySource ?? lastTelemetrySource ?? "idle",
             runActive: process != nil
         )
 
         latestMetrics = sample
         metricsView.push(sample)
+        telemetryWindowController?.push(sample: sample)
         refreshGuardrailLine()
         updateStatusButton()
     }
@@ -1922,13 +3790,27 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             return
         }
 
+        let running = process != nil
+        if let image = NSImage(systemSymbolName: running ? "cpu.fill" : "cpu", accessibilityDescription: "ANEBar") {
+            image.isTemplate = true
+            button.image = image
+        }
+
+        button.imagePosition = compactMenubar ? .imageOnly : .imageLeading
+
         guard let latestMetrics else {
-            button.title = process == nil ? "ANE" : "ANE*"
+            button.title = compactMenubar ? "" : (running ? "ANE*" : "ANE")
+            button.toolTip = "ANEBar"
             return
         }
 
-        let prefix = process == nil ? "ANE" : "ANE*"
-        button.title = String(format: "%@ %.0f/%.0f", prefix, latestMetrics.pCoreUsage, latestMetrics.eCoreUsage)
+        if compactMenubar {
+            button.title = ""
+        } else {
+            let prefix = running ? "ANE*" : "ANE"
+            button.title = String(format: "%@ %.0f/%.0f", prefix, latestMetrics.pCoreUsage, latestMetrics.eCoreUsage)
+        }
+
         button.toolTip = String(
             format: "P %.1f%%  E %.1f%%  Mem %.1f%%  Load %.2f",
             latestMetrics.pCoreUsage,
@@ -1948,24 +3830,59 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
     }
 
     private func parseMetricsLine(_ line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("{"),
+           let data = trimmed.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let type = json["type"] as? String
+        {
+            switch type {
+            case "perf":
+                if let aneTFLOPS = json["ane_tflops"] as? Double {
+                    lastANETflops = aneTFLOPS
+                    currentRunAneTFLOPS = aneTFLOPS
+                    lastANEUpdateAt = Date()
+                }
+                if let utilization = json["ane_util_pct"] as? Double {
+                    lastANEUtilization = utilization
+                    currentRunAneUtilization = utilization
+                    lastANEUpdateAt = Date()
+                }
+                setTelemetrySource("live JSON stream")
+            case "batch":
+                if let msPerStep = json["ms_per_step"] as? Double {
+                    currentRunAvgTrainMS = msPerStep
+                }
+                setTelemetrySource("live JSON stream")
+            case "step":
+                setTelemetrySource("live JSON stream")
+            default:
+                break
+            }
+        }
+
         if let utilization = captureDouble(in: line, pattern: #"ANE utilization:\s*([0-9]+(?:\.[0-9]+)?)%"#) {
             lastANEUtilization = utilization
             currentRunAneUtilization = utilization
             lastANEUpdateAt = Date()
+            setTelemetrySource("stdout summary")
         }
 
         if let aneTFLOPS = captureDouble(in: line, pattern: #"ANE TFLOPS:\s*([0-9]+(?:\.[0-9]+)?)"#) {
             lastANETflops = aneTFLOPS
             currentRunAneTFLOPS = aneTFLOPS
             lastANEUpdateAt = Date()
+            setTelemetrySource("stdout summary")
         }
 
         if let totalTFLOPS = captureDouble(in: line, pattern: #"Total TFLOPS:\s*([0-9]+(?:\.[0-9]+)?)"#) {
             currentRunTotalTFLOPS = totalTFLOPS
+            setTelemetrySource("stdout summary")
         }
 
         if let avgTrainMS = captureDouble(in: line, pattern: #"Avg train:\s*([0-9]+(?:\.[0-9]+)?)\s*ms/step"#) {
             currentRunAvgTrainMS = avgTrainMS
+            setTelemetrySource("stdout summary")
         }
     }
 
@@ -2070,7 +3987,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             let item = modelDetailItems[index]
             if index < lines.count {
                 item.title = truncate(lines[index], maxLength: 72)
-                item.isHidden = false
+                item.isHidden = compactLayout
             } else {
                 item.title = ""
                 item.isHidden = true
@@ -2078,6 +3995,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         }
 
         lastModelCatalog = catalog
+        applyMenuDensity()
     }
 
     private func refreshUpstreamInfo(force: Bool) {
@@ -2106,10 +4024,11 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             upstreamHeadItem.title = "HEAD: unavailable"
             upstreamMetaItem.title = "Repo status: not a git repository"
             upstreamSyncItem.title = "Sync: unavailable"
+            applyMenuDensity()
             return
         }
 
-        upstreamHeadItem.title = "HEAD: \(head.shortSHA) \(truncate(head.subject, maxLength: 52))"
+        upstreamHeadItem.title = "HEAD: \(head.shortSHA) \(truncate(head.subject, maxLength: 40))"
 
         let relativeFormatter = RelativeDateTimeFormatter()
         relativeFormatter.unitsStyle = .short
@@ -2125,6 +4044,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             statusLineItem.title = "Status: repo head changed to \(head.shortSHA)"
         }
         lastSeenRepoSHA = head.shortSHA
+        applyMenuDensity()
     }
 
     private func runDueQueueIfNeeded() {
@@ -2134,18 +4054,33 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         guard let next = queueStore.duePending() else {
             return
         }
-        guard let preset = RunPreset(rawValue: next.preset) else {
+
+        let resolvedExperiment: ExperimentDefinition?
+        if let experimentID = next.experimentID {
+            if experimentID.hasPrefix("preset."),
+               let preset = RunPreset(rawValue: String(experimentID.dropFirst("preset.".count))) {
+                resolvedExperiment = experiment(for: preset)
+            } else {
+                resolvedExperiment = experimentByID(experimentID)
+            }
+        } else if let preset = RunPreset(rawValue: next.preset) {
+            resolvedExperiment = experiment(for: preset)
+        } else {
+            resolvedExperiment = nil
+        }
+
+        guard let experiment = resolvedExperiment else {
             queueStore.markFinished(id: next.id, exitCode: 1)
             refreshQueueSummary()
             return
         }
-        if let reason = guardrailBlockReason(for: preset) {
+        if let reason = guardrailBlockReason(for: experiment) {
             queueSummaryItem.title = "Queue blocked: \(reason)"
             return
         }
         queueStore.markRunning(id: next.id)
         refreshQueueSummary()
-        runPreset(preset, queueItemID: next.id)
+        runExperiment(experiment, queueItemID: next.id)
     }
 
     private func refreshQueueSummary() {
@@ -2158,22 +4093,12 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .short
         let nextLabel = formatter.localizedString(for: sorted[0].scheduledAt, relativeTo: Date())
-        queueSummaryItem.title = "Queue: \(pending.count) pending | next \(nextLabel)"
-    }
-
-    private func guardrailBlockReason(for preset: RunPreset) -> String? {
-        if preset == .fast {
-            return nil
+        let nextTitle = sorted[0].title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let nextTitle, !nextTitle.isEmpty {
+            queueSummaryItem.title = "Queue: \(pending.count) pending | \(nextTitle) \(nextLabel)"
+        } else {
+            queueSummaryItem.title = "Queue: \(pending.count) pending | next \(nextLabel)"
         }
-        let thermal = ProcessInfo.processInfo.thermalState
-        if thermal == .serious || thermal == .critical {
-            return "thermal \(thermalLabel(thermal))"
-        }
-        let battery = readBatteryStatus()
-        if let percent = battery.percent, !battery.isCharging, percent < 30 {
-            return "battery \(percent)% and unplugged"
-        }
-        return nil
     }
 
     private func refreshGuardrailLine() {
@@ -2237,11 +4162,13 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
 
         NSWorkspace.shared.open(outDir)
         statusLineItem.title = "Status: exported repro bundle"
+        reopenMenuIfNeeded()
     }
 
     @objc private func openBenchmarkSummary() {
         let url = writeBenchmarkSummaryFile()
         NSWorkspace.shared.open(url)
+        reopenMenuIfNeeded()
     }
 
     private func writeBenchmarkSummaryFile() -> URL {
@@ -2268,8 +4195,8 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         lines.append(bestUtil != nil ? String(format: "- Best Utilization: %.2f%%", bestUtil!) : "- Best Utilization: n/a")
         lines.append(bestLatency != nil ? String(format: "- Best Avg Train: %.2fms", bestLatency!) : "- Best Avg Train: n/a")
         lines.append("")
-        lines.append("| Ended | Mode | Head | ANE TFLOPS | Util % | Avg ms |")
-        lines.append("|---|---|---|---:|---:|---:|")
+        lines.append("| Ended | Mode | Head | ANE TFLOPS | Util % | Avg ms | Telemetry |")
+        lines.append("|---|---|---|---:|---:|---:|---|")
 
         let formatter = ISO8601DateFormatter()
         for run in runs.suffix(20) {
@@ -2278,7 +4205,9 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             let util = run.aneUtilization.map { String(format: "%.2f", $0) } ?? "-"
             let avg = run.avgTrainMS.map { String(format: "%.2f", $0) } ?? "-"
             let head = run.repoHead ?? "-"
-            lines.append("| \(ended) | \(run.mode) | \(head) | \(tflops) | \(util) | \(avg) |")
+            let mode = run.title ?? run.mode
+            let telemetry = run.telemetrySource ?? "-"
+            lines.append("| \(ended) | \(mode) | \(head) | \(tflops) | \(util) | \(avg) | \(telemetry) |")
         }
 
         try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
@@ -2287,15 +4216,19 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
 
     private func refreshRunHistoryLines() {
         let recent = historyStore.recent(limit: 2)
+        historyWindowController?.update(records: historyStore.recentDescending(limit: 120), repoRoot: repoRoot)
+        historyWindowController?.setBusy(process != nil)
         guard let latest = recent.last else {
             historySummaryItem.title = "Run history: none"
             historyDetailItem.title = "Last metrics: n/a"
             historyDeltaItem.title = "Comparison: n/a"
+            applyMenuDensity()
             return
         }
 
         let outcome = latest.exitCode == 0 ? "ok" : "failed(\(latest.exitCode))"
-        historySummaryItem.title = "Last run: \(latest.mode) | \(outcome) | \(formatDuration(latest.durationSeconds))"
+        let latestLabel = latest.title ?? latest.mode
+        historySummaryItem.title = "Last run: \(latestLabel) | \(outcome) | \(formatDuration(latest.durationSeconds))"
 
         var metricParts: [String] = []
         if let tflops = latest.aneTFLOPS {
@@ -2327,6 +4260,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         }
 
         historyDeltaItem.title = deltas.isEmpty ? "Comparison: n/a" : "Comparison: \(deltas.joined(separator: " | "))"
+        applyMenuDensity()
     }
 
     private func hydrateMetricsFromResearchArtifactsIfNeeded(command: String) {
@@ -2354,6 +4288,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
             lastANETflops = tflops
             lastANEUpdateAt = Date()
         }
+        setTelemetrySource("artifact summary")
     }
 }
 

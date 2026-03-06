@@ -11,7 +11,9 @@ Minimal macOS menu bar app to control the ANE research workflow.
 - Research-metrics fallback parser (`qos_summary.csv` / `probe_summary.json`) so ANE graph does not stay empty on research runs
 - Model intelligence panel (family counts, size buckets, new-in-24h/7d, missing tokenizer/config hints)
 - Guardrails for heavy runs (thermal + battery state)
-- Local chat window with model selector and streaming output (Ollama runtime)
+- Dedicated history window for recent runs and quick comparison
+- ANE chat window with model selector and streaming output (configurable ANE runtime command)
+- Keep-menu-open toggle for persistent in-menu control clicks
 - Repro bundle export + benchmark summary generation
 - Open generated result folder and hero graphics
 - Copy today's premium post draft to clipboard
@@ -49,5 +51,5 @@ ANE_REPO_PATH=/Users/yourname/path/to/ANE swift run ANEBar
 - Pipeline command executed from selected repo root.
 - ANE run metrics appear when the pipeline emits `ANE utilization` / `ANE TFLOPS` lines.
 - When those lines are missing, ANEbar reads research summary files under `training/research/results/data`.
-- Chat uses `ollama` (`ollama list`, `ollama run`) for local model selection and streaming.
+- Chat uses a configurable ANE runtime command template (`{model}`, `{prompt}`, `{repo}` placeholders).
 - Queue state and benchmark summary are persisted in `~/Library/Application Support/ANEBar/`.

@@ -14,17 +14,27 @@ It is built for daily research + social publishing workflows: run experiments, m
 ## Key Features
 
 - Live metrics panel with rolling graph:
+  - larger chart area for better readability
   - P-core usage
   - E-core usage
   - memory usage
   - ANE utilization and TFLOPS (when emitted by the pipeline)
   - fallback extraction from research result files when stdout metrics are absent
+- Visual density controls:
+  - compact menu layout toggle (default on)
+  - compact menubar label toggle (default on)
+  - keep-menu-open toggle for persistent click workflow
 - Queue + scheduler controls for fast/full/benchmark run presets
+- Dedicated operator panels:
+  - experiment console
+  - telemetry panel
+  - history + compare panel
 - Guardrails for heavier runs (battery + thermal checks)
 - Local chat panel:
   - model selector
   - streaming responses
-  - built around local `ollama` runtime
+  - runs through configurable ANE runtime command templates (repo-native)
+  - template placeholders: `{model}`, `{prompt}`, `{repo}`
 - Repro bundle export + benchmark summary markdown for repeatable reporting
 - Model tracker:
   - continuously scans the selected ANE repo
@@ -46,6 +56,7 @@ It is built for daily research + social publishing workflows: run experiments, m
 - `apps/ANEBar` - Swift/AppKit menu bar application
 - `upstream/ANE` - ANE upstream as a git submodule
 - `scripts/install_bar.sh` - package and install `ANEBar.app`
+- `scripts/open_bar.sh` - auto-rebuild if sources changed, otherwise just open app
 - `scripts/sync_ane.sh` - update ANE submodule to latest `main`
 - `scripts/bootstrap_private_refs.sh` - optional hidden local clones for private references
 - `scripts/sync_private_refs.sh` - update hidden local clones
@@ -91,6 +102,8 @@ Common install commands:
 ./scripts/install_bar.sh --debug
 ./scripts/install_bar.sh --remove-login
 ./scripts/install_bar.sh --no-launch
+./scripts/open_bar.sh
+./scripts/open_bar.sh --force-rebuild
 ```
 
 ## Pointing ANEbar to the Right Repo

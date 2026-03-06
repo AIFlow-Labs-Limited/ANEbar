@@ -104,7 +104,10 @@ enable_login_agent() {
   local launch_agent="${launch_agents_dir}/${BUNDLE_ID}.plist"
   local label="${BUNDLE_ID}"
   local binary_path="${installed_bundle}/Contents/MacOS/${APP_NAME}"
-  local ane_repo_path="${ROOT_DIR}/upstream/ANE"
+  local ane_repo_path="${ROOT_DIR}/ANE"
+  if [[ ! -d "${ane_repo_path}" && -d "${ROOT_DIR}/upstream/ANE" ]]; then
+    ane_repo_path="${ROOT_DIR}/upstream/ANE"
+  fi
 
   mkdir -p "${launch_agents_dir}"
 
