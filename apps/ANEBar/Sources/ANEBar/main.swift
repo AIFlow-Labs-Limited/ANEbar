@@ -510,7 +510,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
         group: .peak,
         workingDirectory: "{repo}",
         buildCommand: nil,
-        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} inmem_peak 12",
+        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} inmem_peak 28",
         telemetry: "summary stream",
         sourcePath: "inmem_peak.m"
     ))
@@ -521,7 +521,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
         group: .peak,
         workingDirectory: "{repo}",
         buildCommand: nil,
-        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} inmem_bench 8",
+        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} inmem_bench 18",
         telemetry: "summary stream",
         sourcePath: "inmem_bench.m"
     ))
@@ -532,7 +532,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
         group: .peak,
         workingDirectory: "{repo}",
         buildCommand: nil,
-        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} sram_bench 8",
+        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} sram_bench 18",
         telemetry: "summary stream",
         sourcePath: "sram_bench.m"
     ))
@@ -543,7 +543,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
         group: .peak,
         workingDirectory: "{repo}",
         buildCommand: nil,
-        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} sram_probe 8",
+        runCommand: "bash {anebar}/scripts/run_live_probe.sh {repo} sram_probe 18",
         telemetry: "summary stream",
         sourcePath: "sram_probe.m",
         advanced: true
@@ -640,7 +640,7 @@ private func discoverExperimentCatalog(in repoRoot: String, profile: RepoProfile
                 workingDirectory: "{repo}",
                 buildCommand: id == "test_qos_sweep" ? nil : "make -C training \(id)",
                 runCommand: id == "test_qos_sweep"
-                    ? "bash {anebar}/scripts/run_live_probe.sh {repo} test_qos_sweep 12"
+                    ? "bash {anebar}/scripts/run_live_probe.sh {repo} test_qos_sweep 20"
                     : "./training/\(id)",
                 telemetry: id == "test_qos_sweep" ? "summary stream" : "stdout summary",
                 sourcePath: "training/\(id).m",
@@ -1775,6 +1775,7 @@ private final class ExperimentConsoleWindowController: NSWindowController {
     private let summaryLabel = NSTextField(labelWithString: "ANE experiments")
     private let detailLabel = NSTextField(labelWithString: "")
     private let activityLabel = NSTextField(labelWithString: "Idle")
+    private let metricsPreview = LiveMetricsMenuView(frame: NSRect(x: 0, y: 0, width: 720, height: 248))
     private let scrollView = NSScrollView()
     private let contentStack = NSStackView()
     private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
@@ -1821,6 +1822,10 @@ private final class ExperimentConsoleWindowController: NSWindowController {
         rebuildContent(experiments: filteredExperiments())
     }
 
+    func push(sample: LiveMetricsSample) {
+        metricsPreview.push(sample)
+    }
+
     func setBusy(_ busy: Bool) {
         isBusy = busy
         for button in runButtons {
@@ -1862,6 +1867,7 @@ private final class ExperimentConsoleWindowController: NSWindowController {
         detailLabel.maximumNumberOfLines = 2
         activityLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
         activityLabel.textColor = .secondaryLabelColor
+        metricsPreview.translatesAutoresizingMaskIntoConstraints = false
 
         searchField.placeholderString = "Search experiments"
         searchField.target = self
@@ -1907,7 +1913,7 @@ private final class ExperimentConsoleWindowController: NSWindowController {
             contentStack.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
         ])
 
-        let root = NSStackView(views: [headerStack, detailLabel, activityLabel, filterStack, scrollView])
+        let root = NSStackView(views: [headerStack, detailLabel, activityLabel, metricsPreview, filterStack, scrollView])
         root.orientation = .vertical
         root.spacing = 10
         root.translatesAutoresizingMaskIntoConstraints = false
@@ -1918,6 +1924,7 @@ private final class ExperimentConsoleWindowController: NSWindowController {
             root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
             root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
             root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -16),
+            metricsPreview.heightAnchor.constraint(greaterThanOrEqualToConstant: 248),
         ])
     }
 
@@ -4857,6 +4864,7 @@ final class ANEBarController: NSObject, NSApplicationDelegate {
         latestMetrics = sample
         metricsView.push(sample)
         telemetryWindowController?.push(sample: sample)
+        experimentsWindowController?.push(sample: sample)
         refreshPowerLine()
         refreshGuardrailLine()
         updateStatusButton()

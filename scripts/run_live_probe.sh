@@ -4,7 +4,7 @@ set -o pipefail
 
 REPO_ROOT="${1:-}"
 EXPERIMENT_ID="${2:-}"
-ITERATIONS="${3:-10}"
+ITERATIONS="${3:-20}"
 PEAK_TFLOPS="${ANE_PEAK_TFLOPS:-15.8}"
 
 if [[ -z "${REPO_ROOT}" || -z "${EXPERIMENT_ID}" ]]; then
@@ -135,6 +135,6 @@ for ((i = 1; i <= ITERATIONS; i++)); do
   esac
 
   if [[ "${i}" -lt "${ITERATIONS}" ]]; then
-    sleep 0.4
+    sleep 0.6
   fi
 done
